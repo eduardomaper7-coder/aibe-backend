@@ -1,0 +1,4 @@
+.env
+aibe.db
+__pycache__/
+.venv/
