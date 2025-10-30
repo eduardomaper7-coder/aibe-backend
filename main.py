@@ -1,6 +1,6 @@
 import os, time, json
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -11,6 +11,8 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Integer, Float, Text
 from starlette.middleware.sessions import SessionMiddleware
+from itsdangerous import URLSafeSerializer
+from supabase import create_client, Client
 
 from gbp_client import GBPClient
 
@@ -20,7 +22,7 @@ load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8001/auth/google/callback")
-FRONTEND_POST_LOGIN_URL = os.getenv("FRONTEND_POST_LOGIN_URL", "http://localhost:3000")
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://aibetech.es")  # para postMessage
 GOOGLE_SCOPES = os.getenv(
     "GOOGLE_OAUTH_SCOPES",
     "https://www.googleapis.com/auth/business.manage openid email profile",
@@ -28,10 +30,19 @@ GOOGLE_SCOPES = os.getenv(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibe.db")
 
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
 if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
     raise RuntimeError("Faltan GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET en .env")
+if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
+    raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
 
-# ---------------------- DATABASE ----------------------
+# ---------------------- Supabase (server-side) ----------------------
+sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+STATE_SIGNER = URLSafeSerializer(os.getenv("SECRET_KEY", "dev-secret"), salt="google-oauth")
+
+# ---------------------- DATABASE (local, mínimo) ----------------------
 class Base(DeclarativeBase):
     pass
 
@@ -57,7 +68,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        "https://aibetech.es",  # dominio del front
+        FRONTEND_ORIGIN,  # dominio del front
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -109,66 +120,65 @@ async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-# ---------------------- ROUTES ----------------------
+# ---------------------- ROUTES: OAuth ----------------------
 @app.get("/auth/google/login")
-async def google_login(request: Request):
-    # Redirige a Google OAuth
+async def google_login(request: Request, email: str = Query(..., min_length=3)):
+    """
+    Abre Google OAuth. Firmamos el email en el 'state' para recuperarlo en el callback.
+    """
+    email = email.strip().lower()
+    state = STATE_SIGNER.dumps({"email": email})
     return await oauth.google.authorize_redirect(
         request,
         redirect_uri=GOOGLE_REDIRECT_URI,
         access_type="offline",
         prompt="consent",
         include_granted_scopes="true",
+        state=state,
     )
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
     try:
         token = await oauth.google.authorize_access_token(request)
-        print("Token keys:", list(token.keys()))
+        # 1) validar state y extraer email
+        raw_state = request.query_params.get("state")
+        data = STATE_SIGNER.loads(raw_state)  # lanza si el state está manipulado
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            return HTMLResponse("<p>Missing email</p>", status_code=400)
 
+        # 2) tokens
         access_token = token.get("access_token")
-        refresh_token = token.get("refresh_token")
-        expires_at = float(token.get("expires_at", time.time() + 3600))
-
+        refresh_token = token.get("refresh_token") or ""
         if not access_token:
-            html = """
+            html = f"""
 <!doctype html><html><body>
 <script>
-  try {
-    window.opener && window.opener.postMessage({type:'oauth-complete', ok:false, error:'sin_access_token'}, 'https://aibetech.es');
-  } catch (e) {}
+  try {{
+    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:'sin_access_token'}}, '{FRONTEND_ORIGIN}');
+  }} catch (e) {{}}
   window.close();
 </script>
 <p>Error: Google no devolvió access_token</p>
 </body></html>"""
             return HTMLResponse(html, status_code=400)
 
-        # Guarda/actualiza token
-        async with Session() as s:
-            obj = await s.get(OAuthToken, 1)
-            if not obj:
-                obj = OAuthToken(
-                    id=1,
-                    provider="google",
-                    access_token=access_token,
-                    refresh_token=refresh_token or "",
-                    expires_at=expires_at,
-                )
-                s.add(obj)
-            else:
-                obj.access_token = access_token
-                obj.refresh_token = refresh_token or obj.refresh_token
-                obj.expires_at = expires_at
-            await s.commit()
+        # 3) Guardar/actualizar conexión en Supabase por email (clave: user_email)
+        sb.table("google_connections").upsert({
+            "user_email": email,
+            "refresh_token": refresh_token,                 # <- lo importante para no reconectar
+            "scope": token.get("scope"),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }, on_conflict="user_email").execute()
 
-        # ✅ ÉXITO: avisa al opener (frontend) y cierra el popup
-        html_ok = """
+        # 4) Avisar al opener (frontend) y cerrar el popup
+        html_ok = f"""
 <!doctype html><html><body>
 <script>
-  try {
-    window.opener && window.opener.postMessage({type:'oauth-complete', ok:true}, 'https://aibetech.es');
-  } catch (e) {}
+  try {{
+    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:true}}, '{FRONTEND_ORIGIN}');
+  }} catch (e) {{}}
   window.close();
 </script>
 <p>Login completado. Puedes cerrar esta ventana.</p>
@@ -181,7 +191,7 @@ async def google_callback(request: Request):
 <!doctype html><html><body>
 <script>
   try {{
-    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, 'https://aibetech.es');
+    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, '{FRONTEND_ORIGIN}');
   }} catch (e) {{}}
   window.close();
 </script>
@@ -194,7 +204,7 @@ async def google_callback(request: Request):
 <!doctype html><html><body>
 <script>
   try {{
-    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, 'https://aibetech.es');
+    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, '{FRONTEND_ORIGIN}');
   }} catch (e) {{}}
   window.close();
 </script>
@@ -202,7 +212,18 @@ async def google_callback(request: Request):
 </body></html>"""
         return HTMLResponse(html_exc, status_code=500)
 
-# ---------------------- GBP ROUTES ----------------------
+@app.post("/integrations/google/status")
+async def google_status(body: dict):
+    """
+    Devuelve si el usuario (por email) ya tiene conexión guardada.
+    """
+    email = (body.get("email") or "").strip().lower()
+    if not email:
+        return {"connected": False}
+    q = sb.table("google_connections").select("user_email").eq("user_email", email).maybe_single().execute()
+    return {"connected": q.data is not None}
+
+# ---------------------- GBP ROUTES (ejemplo) ----------------------
 @app.get("/accounts")
 async def accounts(client: GBPClient = Depends(gbp_client)):
     return await client.list_accounts()
@@ -222,6 +243,7 @@ async def reply(body: ReplyBody, client: GBPClient = Depends(gbp_client)):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
 
 
 
