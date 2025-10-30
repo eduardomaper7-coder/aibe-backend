@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from authlib.integrations.starlette_client import OAuth
 from authlib.integrations.base_client.errors import OAuthError
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, HTMLResponse
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Integer, Float, Text
@@ -14,6 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from gbp_client import GBPClient
 
+# ---------------------- CONFIG ----------------------
 load_dotenv()
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -30,7 +31,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibe.db")
 if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
     raise RuntimeError("Faltan GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET en .env")
 
-# ---------- Base de datos mínima ----------
+# ---------------------- DATABASE ----------------------
 class Base(DeclarativeBase):
     pass
 
@@ -47,19 +48,23 @@ class OAuthToken(Base):
 engine = create_async_engine(DATABASE_URL, echo=False)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 
-# ---------- App ----------
+# ---------------------- APP ----------------------
 app = FastAPI(title="AIBE Backend")
 
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "https://aibetech.es",  # dominio del front
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Sesiones (necesarias para OAuth). same_site=lax ayuda con cookies.
+# Sesiones (necesarias para OAuth)
 app.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SECRET_KEY", "dev-secret"),
@@ -75,6 +80,7 @@ oauth.register(
     client_kwargs={"scope": GOOGLE_SCOPES},
 )
 
+# ---------------------- HELPERS ----------------------
 async def get_token(session=Depends(Session)) -> OAuthToken:
     async with session as s:
         res = await s.get(OAuthToken, 1)
@@ -97,28 +103,28 @@ class ReplyBody(BaseModel):
     review_id: str
     reply_text: str
 
+# ---------------------- EVENTS ----------------------
 @app.on_event("startup")
 async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
+# ---------------------- ROUTES ----------------------
 @app.get("/auth/google/login")
 async def google_login(request: Request):
-    # Forzar refresh_token y consentimiento en cada login
-   return await oauth.google.authorize_redirect(
-    request,
-    redirect_uri=GOOGLE_REDIRECT_URI,
-    access_type="offline",
-    prompt="consent",
-    include_granted_scopes="true",
-)
-
+    # Redirige a Google OAuth
+    return await oauth.google.authorize_redirect(
+        request,
+        redirect_uri=GOOGLE_REDIRECT_URI,
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
     try:
         token = await oauth.google.authorize_access_token(request)
-        # Log mínimo (no imprime secretos completos)
         print("Token keys:", list(token.keys()))
 
         access_token = token.get("access_token")
@@ -126,11 +132,19 @@ async def google_callback(request: Request):
         expires_at = float(token.get("expires_at", time.time() + 3600))
 
         if not access_token:
-            return JSONResponse(
-                {"status": "error", "where": "callback", "detail": "Google no devolvió access_token"},
-                status_code=400,
-            )
+            html = """
+<!doctype html><html><body>
+<script>
+  try {
+    window.opener && window.opener.postMessage({type:'oauth-complete', ok:false, error:'sin_access_token'}, 'https://aibetech.es');
+  } catch (e) {}
+  window.close();
+</script>
+<p>Error: Google no devolvió access_token</p>
+</body></html>"""
+            return HTMLResponse(html, status_code=400)
 
+        # Guarda/actualiza token
         async with Session() as s:
             obj = await s.get(OAuthToken, 1)
             if not obj:
@@ -148,16 +162,47 @@ async def google_callback(request: Request):
                 obj.expires_at = expires_at
             await s.commit()
 
-        # Por ahora, devolvemos JSON (sin redirigir al front)
-        return {"status": "ok", "message": "Login completado correctamente", "has_refresh": bool(refresh_token)}
+        # ✅ ÉXITO: avisa al opener (frontend) y cierra el popup
+        html_ok = """
+<!doctype html><html><body>
+<script>
+  try {
+    window.opener && window.opener.postMessage({type:'oauth-complete', ok:true}, 'https://aibetech.es');
+  } catch (e) {}
+  window.close();
+</script>
+<p>Login completado. Puedes cerrar esta ventana.</p>
+</body></html>"""
+        return HTMLResponse(html_ok)
 
     except OAuthError as oe:
-        # p.ej., MismatchingStateError por problema de cookie/sesión/host
-        return JSONResponse({"status": "error", "where": "oauth", "detail": str(oe)}, status_code=400)
+        err = json.dumps(str(oe))
+        html_err = f"""
+<!doctype html><html><body>
+<script>
+  try {{
+    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, 'https://aibetech.es');
+  }} catch (e) {{}}
+  window.close();
+</script>
+<p>Error OAuth: {str(oe)}</p>
+</body></html>"""
+        return HTMLResponse(html_err, status_code=400)
     except Exception as e:
-        import traceback; traceback.print_exc()
-        return JSONResponse({"status": "error", "where": "callback-except", "detail": str(e)}, status_code=500)
+        err = json.dumps(str(e))
+        html_exc = f"""
+<!doctype html><html><body>
+<script>
+  try {{
+    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, 'https://aibetech.es');
+  }} catch (e) {{}}
+  window.close();
+</script>
+<p>Error: {str(e)}</p>
+</body></html>"""
+        return HTMLResponse(html_exc, status_code=500)
 
+# ---------------------- GBP ROUTES ----------------------
 @app.get("/accounts")
 async def accounts(client: GBPClient = Depends(gbp_client)):
     return await client.list_accounts()
@@ -177,5 +222,6 @@ async def reply(body: ReplyBody, client: GBPClient = Depends(gbp_client)):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
 
 
