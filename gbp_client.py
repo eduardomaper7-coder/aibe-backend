@@ -1,67 +1,41 @@
-import time
-import httpx
-from typing import Dict, Any, Optional
+# gbp_client.py
+import time, requests
+from dataclasses import dataclass
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GBP_API = "https://mybusiness.googleapis.com/v4"
+BUSINESS_API = "https://businessprofile.googleapis.com/v1"
 
-class GBPClient:
-    """Cliente mínimo para Google Business Profile API usando tokens OAuth de usuario."""
+@dataclass
+class TokenBundle:
+    access_token: str
+    refresh_token: str
+    expiry_epoch: int  # segundos UNIX
 
-    def __init__(self, client_id: str, client_secret: str, access_token: str, refresh_token: str, expires_at: float):
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.access_token = access_token
-        self.refresh_token = refresh_token
-        self.expires_at = expires_at  # timestamp en segundos
+def ensure_valid_token(tb: TokenBundle, client_id: str, client_secret: str) -> TokenBundle:
+    # refresca si quedan < 2 min
+    if tb.expiry_epoch - int(time.time()) > 120:
+        return tb
+    creds = Credentials(
+        token=tb.access_token,
+        refresh_token=tb.refresh_token,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=["https://www.googleapis.com/auth/business.manage"]
+    )
+    creds.refresh(Request())
+    # google-auth no da expiry_epoch directo, calculamos aprox 55 min
+    return TokenBundle(
+        access_token=creds.token,
+        refresh_token=tb.refresh_token,
+        expiry_epoch=int(time.time()) + 3300
+    )
 
-    async def _ensure_token(self) -> None:
-        if time.time() < self.expires_at - 60:
-            return
-        async with httpx.AsyncClient(timeout=30) as client:
-            data = {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "refresh_token": self.refresh_token,
-                "grant_type": "refresh_token",
-            }
-            r = await client.post(GOOGLE_TOKEN_URL, data=data)
-            r.raise_for_status()
-            tok = r.json()
-            self.access_token = tok["access_token"]
-            self.expires_at = time.time() + tok.get("expires_in", 3600)
+def gbp_get(path: str, access_token: str, params: dict | None = None):
+    r = requests.get(f"{BUSINESS_API}/{path}", params=params, headers={
+        "Authorization": f"Bearer {access_token}"
+    })
+    r.raise_for_status()
+    return r.json()
 
-    async def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        await self._ensure_token()
-        headers = {"Authorization": f"Bearer {self.access_token}"}
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(f"{GBP_API}{path}", headers=headers, params=params)
-            r.raise_for_status()
-            return r.json()
-
-    async def _post(self, path: str, json: Dict[str, Any]) -> Dict[str, Any]:
-        await self._ensure_token()
-        headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json"}
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(f"{GBP_API}{path}", headers=headers, json=json)
-            r.raise_for_status()
-            return r.json() if r.text else {}
-
-    async def list_accounts(self) -> Dict[str, Any]:
-        return await self._get("/accounts")
-
-    async def list_locations(self, account_id: str, page_size: int = 50, page_token: Optional[str] = None) -> Dict[str, Any]:
-        params = {"pageSize": page_size}
-        if page_token:
-            params["pageToken"] = page_token
-        return await self._get(f"/accounts/{account_id}/locations", params=params)
-
-    async def list_reviews(self, account_id: str, location_id: str, page_token: Optional[str] = None) -> Dict[str, Any]:
-        params = {"pageSize": 50}
-        if page_token:
-            params["pageToken"] = page_token
-        return await self._get(f"/accounts/{account_id}/locations/{location_id}/reviews", params=params)
-
-    async def update_reply(self, account_id: str, location_id: str, review_id: str, reply_text: str) -> Dict[str, Any]:
-        body = {"comment": reply_text}
-        return await self._post(f"/accounts/{account_id}/locations/{location_id}/reviews/{review_id}:updateReply", json=body)

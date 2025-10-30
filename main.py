@@ -1,5 +1,5 @@
 import os, time, json
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -42,6 +42,9 @@ if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
 
 STATE_SIGNER = URLSafeSerializer(os.getenv("SECRET_KEY", "dev-secret"), salt="google-oauth")
 
+BUSINESS_API = "https://businessprofile.googleapis.com/v1"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
 # ---------------------- Supabase REST helpers ----------------------
 def sb_headers():
     return {
@@ -51,6 +54,10 @@ def sb_headers():
     }
 
 async def upsert_google_connection_by_email(email: str, refresh_token: str, scope: Optional[str]):
+    """
+    Guarda/actualiza la conexión Google por email en tu tabla 'google_connections'
+    (asumimos que existe con columna única user_email).
+    """
     url = f"{SUPABASE_REST_URL}/google_connections?on_conflict=user_email"
     payload = {
         "user_email": email,
@@ -71,6 +78,69 @@ async def is_connected_by_email(email: str) -> bool:
         r.raise_for_status()
         data = r.json()
         return bool(data)
+
+async def get_connection_by_email(email: str) -> Optional[Dict[str, Any]]:
+    url = f"{SUPABASE_REST_URL}/google_connections"
+    params = {"user_email": f"eq.{email}", "select": "user_email,refresh_token,scope", "limit": 1}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=sb_headers(), params=params)
+        r.raise_for_status()
+        data = r.json()
+        return data[0] if data else None
+
+# ---- Upserts de negocio (ubicaciones/reseñas) ----
+async def upsert_locations(rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    url = f"{SUPABASE_REST_URL}/gbp_locations?on_conflict=name"
+    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=rows)
+        r.raise_for_status()
+
+async def upsert_reviews(rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    url = f"{SUPABASE_REST_URL}/gbp_reviews?on_conflict=review_id"
+    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=rows)
+        r.raise_for_status()
+
+async def upsert_review_replies(rows: List[Dict[str, Any]]):
+    if not rows:
+        return
+    url = f"{SUPABASE_REST_URL}/gbp_review_replies?on_conflict=review_id"
+    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(url, headers=headers, json=rows)
+        r.raise_for_status()
+
+# ---------------------- Access token via refresh token ----------------------
+async def exchange_refresh_token(refresh_token: str) -> Dict[str, Any]:
+    """
+    Intercambia el refresh_token por un access_token válido.
+    """
+    data = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(GOOGLE_TOKEN_ENDPOINT, data=data)
+        # Si Google devuelve 400, suele ser refresh_token caducado o inválido
+        if r.status_code >= 400:
+            raise HTTPException(status_code=401, detail=f"Error al refrescar token: {r.text}")
+        return r.json()  # {access_token, expires_in, scope, token_type}
+
+# ---------------------- Llamadas directas a GBP ----------------------
+async def gbp_get(access_token: str, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(f"{BUSINESS_API}/{path}", headers=headers, params=params)
+        r.raise_for_status()
+        return r.json()
 
 # ---------------------- DATABASE (mínima local) ----------------------
 class Base(DeclarativeBase):
@@ -99,7 +169,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://aibetech.es",
-        "https://www.aibetech.es",   # <--- añade esto
+        "https://www.aibetech.es",   # <--- añadido
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -122,8 +192,9 @@ oauth.register(
     client_kwargs={"scope": GOOGLE_SCOPES},
 )
 
-# ---------------------- HELPERS GBP ----------------------
+# ---------------------- HELPERS GBP (legacy deps) ----------------------
 async def get_token(session=Depends(Session)) -> OAuthToken:
+    # Mantengo este helper para no romper tus rutas existentes.
     async with session as s:
         res = await s.get(OAuthToken, 1)
         if not res:
@@ -251,7 +322,122 @@ async def google_status(body: dict):
     connected = await is_connected_by_email(email)
     return {"connected": connected}
 
-# ---------------------- GBP ROUTES (ejemplo) ----------------------
+# ---------------------- NUEVOS ENDPOINTS CLAVE ----------------------
+@app.get("/me/gbp/locations")
+async def list_my_locations(email: str = Query(..., min_length=3)):
+    """
+    Lista TODAS las ubicaciones (locations) de todas las cuentas GBP del usuario (por email)
+    y las upserta en Supabase (gbp_locations).
+    """
+    email = email.strip().lower()
+    conn = await get_connection_by_email(email)
+    if not conn or not conn.get("refresh_token"):
+        raise HTTPException(status_code=401, detail="Usuario sin conexión Google válida.")
+
+    # 1) Conseguir access token
+    token = await exchange_refresh_token(conn["refresh_token"])
+    access_token = token["access_token"]
+
+    # 2) Obtener cuentas y ubicaciones
+    items: List[Dict[str, Any]] = []
+    accounts_resp = await gbp_get(access_token, "accounts")
+    for acc in accounts_resp.get("accounts", []):
+        acc_name = acc["name"]  # "accounts/123..."
+        # Paginación de locations
+        next_token = None
+        while True:
+            params = {"pageSize": 100}
+            if next_token:
+                params["pageToken"] = next_token
+            locs_resp = await gbp_get(access_token, f"{acc_name}/locations", params=params)
+            locs = locs_resp.get("locations", [])
+            for l in locs:
+                items.append({
+                    "account": acc_name,
+                    "location": l["name"],         # "locations/XXXXXXXXXXXX"
+                    "title": l.get("title")
+                })
+            next_token = locs_resp.get("nextPageToken")
+            if not next_token:
+                break
+
+    # 3) Upsert en Supabase (solo name+title)
+    await upsert_locations([{"name": it["location"], "title": it.get("title")} for it in items])
+
+    return {"items": items}
+
+@app.post("/gbp/sync-reviews")
+async def sync_reviews(
+    email: str = Query(..., min_length=3),
+    location_name: str = Query(..., description='Ej: "locations/12345678901234567890"'),
+):
+    """
+    Sincroniza TODAS las reseñas de una ubicación concreta a Supabase (gbp_reviews / gbp_review_replies).
+    Idempotente (upsert).
+    """
+    email = email.strip().lower()
+    conn = await get_connection_by_email(email)
+    if not conn or not conn.get("refresh_token"):
+        raise HTTPException(status_code=401, detail="Usuario sin conexión Google válida.")
+
+    token = await exchange_refresh_token(conn["refresh_token"])
+    access_token = token["access_token"]
+
+    # (opcional) traer info de la location y upsert por si no existe aún
+    try:
+        loc = await gbp_get(access_token, location_name)
+        await upsert_locations([{"name": loc["name"], "title": loc.get("title")}])
+    except Exception:
+        # Si falla, seguimos igualmente con reviews; puede ser falta de permiso de lectura de location details.
+        pass
+
+    total = 0
+    next_token = None
+    while True:
+        params = {"pageSize": 100}
+        if next_token:
+            params["pageToken"] = next_token
+        data = await gbp_get(access_token, f"{location_name}/reviews", params=params)
+
+        review_rows: List[Dict[str, Any]] = []
+        reply_rows: List[Dict[str, Any]] = []
+
+        for r in data.get("reviews", []):
+            name = r.get("name", "")  # "locations/xxx/reviews/YYY"
+            review_id = name.split("/")[-1] if name else None
+            if not review_id:
+                continue
+            review_rows.append({
+                "review_id": review_id,
+                "location_name": location_name,
+                "star_rating": int(r.get("starRating", 0)) if r.get("starRating") else None,
+                "comment": r.get("comment"),
+                "create_time": r.get("createTime"),
+                "update_time": r.get("updateTime"),
+                "reviewer_display_name": (r.get("reviewer") or {}).get("displayName"),
+                "is_anonymous": (r.get("reviewer") or {}).get("isAnonymous", False)
+            })
+            if "reviewReply" in r:
+                rr = r["reviewReply"]
+                reply_rows.append({
+                    "review_id": review_id,
+                    "comment": rr.get("comment"),
+                    "update_time": rr.get("updateTime"),
+                })
+            total += 1
+
+        if review_rows:
+            await upsert_reviews(review_rows)
+        if reply_rows:
+            await upsert_review_replies(reply_rows)
+
+        next_token = data.get("nextPageToken")
+        if not next_token:
+            break
+
+    return {"synced": total}
+
+# ---------------------- GBP ROUTES (ejemplo, legado) ----------------------
 @app.get("/accounts")
 async def accounts(client: GBPClient = Depends(gbp_client)):
     return await client.list_accounts()
@@ -271,6 +457,7 @@ async def reply(body: ReplyBody, client: GBPClient = Depends(gbp_client)):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
 
 
 
