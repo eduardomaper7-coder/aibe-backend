@@ -98,7 +98,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        FRONTEND_ORIGIN,  # dominio del front (prod)
+        "https://aibetech.es",
+        "https://www.aibetech.es",   # <--- añade esto
     ],
     allow_credentials=True,
     allow_methods=["*"],
