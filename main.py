@@ -12,7 +12,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy import String, Integer, Float, Text
 from starlette.middleware.sessions import SessionMiddleware
 from itsdangerous import URLSafeSerializer
-from supabase import create_client, Client
+import httpx
 
 from gbp_client import GBPClient
 
@@ -22,7 +22,7 @@ load_dotenv()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8001/auth/google/callback")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://aibetech.es")  # para postMessage
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://aibetech.es")  # para CORS y postMessage
 GOOGLE_SCOPES = os.getenv(
     "GOOGLE_OAUTH_SCOPES",
     "https://www.googleapis.com/auth/business.manage openid email profile",
@@ -30,19 +30,49 @@ GOOGLE_SCOPES = os.getenv(
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibe.db")
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
+# Supabase (REST)
+SUPABASE_URL = os.getenv("SUPABASE_URL")  # https://xxxxx.supabase.co
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_REST_URL = (SUPABASE_URL.rstrip("/") + "/rest/v1") if SUPABASE_URL else None
 
 if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
     raise RuntimeError("Faltan GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET en .env")
 if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
     raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
 
-# ---------------------- Supabase (server-side) ----------------------
-sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 STATE_SIGNER = URLSafeSerializer(os.getenv("SECRET_KEY", "dev-secret"), salt="google-oauth")
 
-# ---------------------- DATABASE (local, mínimo) ----------------------
+# ---------------------- Supabase REST helpers ----------------------
+def sb_headers():
+    return {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+async def upsert_google_connection_by_email(email: str, refresh_token: str, scope: Optional[str]):
+    url = f"{SUPABASE_REST_URL}/google_connections?on_conflict=user_email"
+    payload = {
+        "user_email": email,
+        "refresh_token": refresh_token,
+        "scope": scope,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+
+async def is_connected_by_email(email: str) -> bool:
+    url = f"{SUPABASE_REST_URL}/google_connections"
+    params = {"user_email": f"eq.{email}", "select": "user_email", "limit": 1}
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers=sb_headers(), params=params)
+        r.raise_for_status()
+        data = r.json()
+        return bool(data)
+
+# ---------------------- DATABASE (mínima local) ----------------------
 class Base(DeclarativeBase):
     pass
 
@@ -68,7 +98,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
-        FRONTEND_ORIGIN,  # dominio del front
+        FRONTEND_ORIGIN,  # dominio del front (prod)
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -91,7 +121,7 @@ oauth.register(
     client_kwargs={"scope": GOOGLE_SCOPES},
 )
 
-# ---------------------- HELPERS ----------------------
+# ---------------------- HELPERS GBP ----------------------
 async def get_token(session=Depends(Session)) -> OAuthToken:
     async with session as s:
         res = await s.get(OAuthToken, 1)
@@ -124,7 +154,7 @@ async def on_startup():
 @app.get("/auth/google/login")
 async def google_login(request: Request, email: str = Query(..., min_length=3)):
     """
-    Abre Google OAuth. Firmamos el email en el 'state' para recuperarlo en el callback.
+    Inicia OAuth con Google. Firmamos el email del usuario en 'state' para recuperarlo en el callback.
     """
     email = email.strip().lower()
     state = STATE_SIGNER.dumps({"email": email})
@@ -141,9 +171,11 @@ async def google_login(request: Request, email: str = Query(..., min_length=3)):
 async def google_callback(request: Request):
     try:
         token = await oauth.google.authorize_access_token(request)
+        print("Token keys:", list(token.keys()))
+
         # 1) validar state y extraer email
         raw_state = request.query_params.get("state")
-        data = STATE_SIGNER.loads(raw_state)  # lanza si el state está manipulado
+        data = STATE_SIGNER.loads(raw_state)  # lanza si se manipuló
         email = (data.get("email") or "").strip().lower()
         if not email:
             return HTMLResponse("<p>Missing email</p>", status_code=400)
@@ -164,13 +196,8 @@ async def google_callback(request: Request):
 </body></html>"""
             return HTMLResponse(html, status_code=400)
 
-        # 3) Guardar/actualizar conexión en Supabase por email (clave: user_email)
-        sb.table("google_connections").upsert({
-            "user_email": email,
-            "refresh_token": refresh_token,                 # <- lo importante para no reconectar
-            "scope": token.get("scope"),
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        }, on_conflict="user_email").execute()
+        # 3) Guardar/actualizar conexión en Supabase por email
+        await upsert_google_connection_by_email(email, refresh_token, token.get("scope"))
 
         # 4) Avisar al opener (frontend) y cerrar el popup
         html_ok = f"""
@@ -215,13 +242,13 @@ async def google_callback(request: Request):
 @app.post("/integrations/google/status")
 async def google_status(body: dict):
     """
-    Devuelve si el usuario (por email) ya tiene conexión guardada.
+    Devuelve si el usuario (por email) ya tiene conexión guardada en Supabase.
     """
     email = (body.get("email") or "").strip().lower()
     if not email:
         return {"connected": False}
-    q = sb.table("google_connections").select("user_email").eq("user_email", email).maybe_single().execute()
-    return {"connected": q.data is not None}
+    connected = await is_connected_by_email(email)
+    return {"connected": connected}
 
 # ---------------------- GBP ROUTES (ejemplo) ----------------------
 @app.get("/accounts")
@@ -243,6 +270,7 @@ async def reply(body: ReplyBody, client: GBPClient = Depends(gbp_client)):
 @app.get("/health")
 async def health():
     return {"ok": True}
+
 
 
 
