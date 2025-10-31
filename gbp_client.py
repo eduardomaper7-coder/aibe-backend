@@ -1,41 +1,23 @@
 # gbp_client.py
-import time, requests
-from dataclasses import dataclass
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
+from typing import Any, Dict
 
-BUSINESS_API = "https://businessprofile.googleapis.com/v1"
+class GBPClient:
+    def __init__(self, client_id: str, client_secret: str, access_token: str, refresh_token: str, expires_at: float):
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.access_token = access_token
+        self.refresh_token = refresh_token
+        self.expires_at = expires_at
 
-@dataclass
-class TokenBundle:
-    access_token: str
-    refresh_token: str
-    expiry_epoch: int  # segundos UNIX
+    async def list_accounts(self) -> Dict[str, Any]:
+        return {"accounts": []}
 
-def ensure_valid_token(tb: TokenBundle, client_id: str, client_secret: str) -> TokenBundle:
-    # refresca si quedan < 2 min
-    if tb.expiry_epoch - int(time.time()) > 120:
-        return tb
-    creds = Credentials(
-        token=tb.access_token,
-        refresh_token=tb.refresh_token,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=client_id,
-        client_secret=client_secret,
-        scopes=["https://www.googleapis.com/auth/business.manage"]
-    )
-    creds.refresh(Request())
-    # google-auth no da expiry_epoch directo, calculamos aprox 55 min
-    return TokenBundle(
-        access_token=creds.token,
-        refresh_token=tb.refresh_token,
-        expiry_epoch=int(time.time()) + 3300
-    )
+    async def list_locations(self, account_id: str) -> Dict[str, Any]:
+        return {"locations": []}
 
-def gbp_get(path: str, access_token: str, params: dict | None = None):
-    r = requests.get(f"{BUSINESS_API}/{path}", params=params, headers={
-        "Authorization": f"Bearer {access_token}"
-    })
-    r.raise_for_status()
-    return r.json()
+    async def list_reviews(self, account_id: str, location_id: str) -> Dict[str, Any]:
+        return {"reviews": []}
+
+    async def update_reply(self, account_id: str, location_id: str, review_id: str, reply_text: str) -> Dict[str, Any]:
+        return {"ok": False, "detail": "Not implemented"}
 
