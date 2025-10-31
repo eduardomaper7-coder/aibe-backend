@@ -42,7 +42,8 @@ if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
 
 STATE_SIGNER = URLSafeSerializer(os.getenv("SECRET_KEY", "dev-secret"), salt="google-oauth")
 
-BUSINESS_API = "https://businessprofile.googleapis.com/v1"
+BUSINESS_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
+
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
 # ---------------------- Supabase REST helpers ----------------------
@@ -137,10 +138,14 @@ async def exchange_refresh_token(refresh_token: str) -> Dict[str, Any]:
 # ---------------------- Llamadas directas a GBP ----------------------
 async def gbp_get(access_token: str, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"{BUSINESS_API}/{path}"
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(f"{BUSINESS_API}/{path}", headers=headers, params=params)
-        r.raise_for_status()
+        r = await client.get(url, headers=headers, params=params)
+        if r.status_code >= 400:
+            # Propaga el mensaje de Google (403, 404, etc.)
+            raise HTTPException(r.status_code, f"GBP API error {r.status_code} on {url}: {r.text}")
         return r.json()
+
 
 # ---------------------- DATABASE (mínima local) ----------------------
 class Base(DeclarativeBase):
