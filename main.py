@@ -285,6 +285,60 @@ class ReplyBody(BaseModel):
     review_id: str
     reply_text: str
 
+    # --- Helper: primera página ligera para sembrar cache ---
+async def fetch_first_page_locations(access_token: str, account_name: str) -> List[Dict[str, Any]]:
+    # Reducimos pageSize para evitar límites en el primer golpe
+    params = {"pageSize": 50}  # 50-100 está bien; menos reduce prob. de 429
+    resp = await gbp_info_get(access_token, f"{account_name}/locations", params=params)
+    items = []
+    for l in resp.get("locations", []):
+        items.append({
+            "account": account_name,
+            "location": l["name"],
+            "title": l.get("title"),
+        })
+    return items
+
+# --- Job en background: completa todas las páginas y refresca cache ---
+async def refresh_locations_full(email: str, refresh_token: str) -> None:
+    try:
+        token = await exchange_refresh_token(refresh_token)
+        access_token = token["access_token"]
+    except Exception:
+        return  # si el refresh falla, salimos en silencio
+
+    aggregated: List[Dict[str, Any]] = []
+    try:
+        accounts_resp = await gbp_get(access_token, "accounts")
+        for acc in accounts_resp.get("accounts", []):
+            acc_name = acc["name"]
+            next_token = None
+            while True:
+                params = {"pageSize": 100}
+                if next_token:
+                    params["pageToken"] = next_token
+                resp = await gbp_info_get(access_token, f"{acc_name}/locations", params=params)
+                for l in resp.get("locations", []):
+                    aggregated.append({
+                        "account": acc_name,
+                        "location": l["name"],
+                        "title": l.get("title"),
+                    })
+                next_token = resp.get("nextPageToken")
+                if not next_token:
+                    break
+
+        # Actualiza cache global y Supabase
+        LOCATIONS_CACHE[email] = {
+            "data": {"items": aggregated},
+            "fetched_at": datetime.utcnow(),
+        }
+        asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in aggregated]))
+    except Exception:
+        # mejor no romper: si Google limita aquí, el front seguirá usando la cache parcial
+        return
+
+
 # ---------------------- EVENTS ----------------------
 @app.on_event("startup")
 async def on_startup():
@@ -423,21 +477,34 @@ async def list_my_locations(email: str = Query(..., min_length=3)):
             headers["Retry-After"] = str(retry_after)
         return JSONResponse(payload, status_code=status_code, headers=headers)
 
+    # Si hay cooldown, sirve cache si existe
     cooldown_until = USER_COOLDOWN_UNTIL.get(email)
-    if cooldown_until and time.time() < cooldown_until:
-        if email in LOCATIONS_CACHE:
-            retry_after = max(1, int(cooldown_until - time.time()))
-            return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
+    if cooldown_until and time.time() < cooldown_until and email in LOCATIONS_CACHE:
+        retry_after = max(1, int(cooldown_until - time.time()))
+        return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
 
+    # Cache fresca
     cached = LOCATIONS_CACHE.get(email)
     if cached and (now - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
-        return JSONResponse({ "items": cached["data"]["items"], "fromCache": True, "stale": False, "fetchedAt": cached["fetched_at"].isoformat() }, status_code=200)
+        return JSONResponse({
+            "items": cached["data"]["items"],
+            "fromCache": True,
+            "stale": False,
+            "fetchedAt": cached["fetched_at"].isoformat()
+        }, status_code=200)
 
     async with lock:
+        # Recheck dentro del lock
         cached = LOCATIONS_CACHE.get(email)
         if cached and (datetime.utcnow() - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
-            return JSONResponse({ "items": cached["data"]["items"], "fromCache": True, "stale": False, "fetchedAt": cached["fetched_at"].isoformat() }, status_code=200)
+            return JSONResponse({
+                "items": cached["data"]["items"],
+                "fromCache": True,
+                "stale": False,
+                "fetchedAt": cached["fetched_at"].isoformat()
+            }, status_code=200)
 
+        # 1) Access token
         try:
             token = await exchange_refresh_token(conn["refresh_token"])
             access_token = token["access_token"]
@@ -445,60 +512,67 @@ async def list_my_locations(email: str = Query(..., min_length=3)):
             LOCATIONS_CACHE.pop(email, None)
             raise
 
+        # 2) Primer éxito ligero: cuentas + SOLO PRIMERA PÁGINA por cuenta
         try:
-            items: List[Dict[str, Any]] = []
+            seed_items: List[Dict[str, Any]] = []
             accounts_resp = await gbp_get(access_token, "accounts")
             for acc in accounts_resp.get("accounts", []):
                 acc_name = acc["name"]
-                next_token = None
-                while True:
-                    params = {"pageSize": 100}
-                    if next_token:
-                        params["pageToken"] = next_token
+                # solo una página pequeña para evitar 429
+                items_fp = await fetch_first_page_locations(access_token, acc_name)
+                seed_items.extend(items_fp)
 
-                    # 🔁 CAMBIO AQUÍ: usamos gbp_info_get para locations
-                    locs_resp = await gbp_info_get(access_token, f"{acc_name}/locations", params=params)
+            # Si conseguimos algo, sembramos cache parcial y lanzamos el full refresh en background
+            if seed_items:
+                LOCATIONS_CACHE[email] = {
+                    "data": {"items": seed_items},
+                    "fetched_at": datetime.utcnow(),
+                }
+                # Upsert parcial y job en background
+                asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in seed_items]))
+                asyncio.create_task(refresh_locations_full(email, conn["refresh_token"]))
 
-                    locs = locs_resp.get("locations", [])
-                    for l in locs:
-                        items.append({
-                            "account": acc_name,
-                            "location": l["name"],
-                            "title": l.get("title")
-                        })
-                    next_token = locs_resp.get("nextPageToken")
-                    if not next_token:
-                        break
+                return JSONResponse({
+                    "items": seed_items,
+                    "fromCache": False,
+                    "stale": False,
+                    "partial": True,   # <- útil para el front si quieres mostrar aviso suave
+                    "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat()
+                }, status_code=200)
 
+            # Si no hay ni cuentas ni locations, respondemos vacío
             LOCATIONS_CACHE[email] = {
-                "data": {"items": items},
+                "data": {"items": []},
                 "fetched_at": datetime.utcnow(),
             }
-            asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in items]))
-
-            return JSONResponse({ "items": items, "fromCache": False, "stale": False, "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat() }, status_code=200)
+            return JSONResponse({
+                "items": [],
+                "fromCache": False,
+                "stale": False,
+                "partial": False,
+                "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat()
+            }, status_code=200)
 
         except HTTPException as e:
+            # 429 en el primer golpe: fija cooldown
             if e.status_code == 429:
                 retry_after = COOLDOWN_DEFAULT
                 try:
-                    # Si e.detail es dict, mejor leerlo así:
                     if isinstance(e.detail, dict) and e.detail.get("retry_after"):
                         retry_after = int(e.detail["retry_after"])
-                    else:
-                        retry_after = int(json.loads(str(e.detail)).get("retry_after", COOLDOWN_DEFAULT))
                 except Exception:
                     pass
                 USER_COOLDOWN_UNTIL[email] = time.time() + retry_after
 
+                # Si hay cache (aunque sea vieja), sírvela; si no, devolvemos 429
                 if email in LOCATIONS_CACHE:
                     return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
                 return JSONResponse({"detail": "Upstream rate limited", "retry_after": retry_after}, status_code=429, headers={"Retry-After": str(retry_after)})
 
+            # Otros errores: sirve cache si existe
             if email in LOCATIONS_CACHE:
                 return respond_with_cache(status_code=200, stale=True)
             raise
-
 
 
 # ---------------------- GBP ROUTES (ejemplo, legado) ----------------------
