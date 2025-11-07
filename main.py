@@ -73,12 +73,21 @@ async def upsert_google_connection_by_email(email: str, refresh_token: str, scop
 
 async def is_connected_by_email(email: str) -> bool:
     url = f"{SUPABASE_REST_URL}/google_connections"
-    params = {"user_email": f"eq.{email}", "select": "user_email", "limit": 1}
+    params = {
+        "user_email": f"eq.{email}",
+        "refresh_token": "not.is.null",
+        "select": "refresh_token",
+        "limit": 1,
+    }
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, headers=sb_headers(), params=params)
         r.raise_for_status()
         data = r.json()
-        return bool(data)
+        if not data:
+            return False
+        # asegura que el refresh_token no esté vacío
+        return bool((data[0].get("refresh_token") or "").strip())
+
 
 async def get_connection_by_email(email: str) -> Optional[Dict[str, Any]]:
     url = f"{SUPABASE_REST_URL}/google_connections"
@@ -258,10 +267,11 @@ async def google_callback(request: Request):
             return HTMLResponse("<p>Missing email</p>", status_code=400)
 
         # 2) tokens
-        access_token = token.get("access_token")
-        refresh_token = token.get("refresh_token") or ""
-        if not access_token:
-            html = f"""
+access_token = token.get("access_token")
+refresh_token = token.get("refresh_token")  # puede venir None o faltar
+
+if not access_token:
+    html = f"""
 <!doctype html><html><body>
 <script>
   try {{
@@ -271,10 +281,14 @@ async def google_callback(request: Request):
 </script>
 <p>Error: Google no devolvió access_token</p>
 </body></html>"""
-            return HTMLResponse(html, status_code=400)
+    return HTMLResponse(html, status_code=400)
 
-        # 3) Guardar/actualizar conexión en Supabase por email
-        await upsert_google_connection_by_email(email, refresh_token, token.get("scope"))
+# 3) Guardar/actualizar conexión en Supabase por email (solo si hay refresh_token)
+if refresh_token and refresh_token.strip():
+    await upsert_google_connection_by_email(email, refresh_token, token.get("scope"))
+else:
+    print(f"[WARN] Google no devolvió refresh_token para {email}, no se guardará conexión.")
+
 
         # 4) Avisar al opener (frontend) y cerrar el popup
         html_ok = f"""
