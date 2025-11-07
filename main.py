@@ -256,6 +256,7 @@ async def google_login(request: Request, email: str = Query(..., min_length=3)):
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
     try:
+        # 0) Intercambiar el código por tokens de Google
         token = await oauth.google.authorize_access_token(request)
         print("Token keys:", list(token.keys()))
 
@@ -266,12 +267,12 @@ async def google_callback(request: Request):
         if not email:
             return HTMLResponse("<p>Missing email</p>", status_code=400)
 
-        # 2) tokens
-access_token = token.get("access_token")
-refresh_token = token.get("refresh_token")  # puede venir None o faltar
+        # 2) tokens (refactor)
+        access_token = token.get("access_token")
+        refresh_token = token.get("refresh_token")  # puede venir None o faltar
 
-if not access_token:
-    html = f"""
+        if not access_token:
+            html = f"""
 <!doctype html><html><body>
 <script>
   try {{
@@ -281,14 +282,14 @@ if not access_token:
 </script>
 <p>Error: Google no devolvió access_token</p>
 </body></html>"""
-    return HTMLResponse(html, status_code=400)
+            return HTMLResponse(html, status_code=400)
 
-# 3) Guardar/actualizar conexión en Supabase por email (solo si hay refresh_token)
-if refresh_token and refresh_token.strip():
-    await upsert_google_connection_by_email(email, refresh_token, token.get("scope"))
-else:
-    print(f"[WARN] Google no devolvió refresh_token para {email}, no se guardará conexión.")
-
+        # 3) Guardar/actualizar conexión en Supabase por email
+        #    Solo si realmente tenemos refresh_token NO vacío
+        if refresh_token and str(refresh_token).strip():
+            await upsert_google_connection_by_email(email, refresh_token, token.get("scope"))
+        else:
+            print(f"[WARN] Google no devolvió refresh_token para {email}; no se guardará conexión.")
 
         # 4) Avisar al opener (frontend) y cerrar el popup
         html_ok = f"""
@@ -316,6 +317,7 @@ else:
 <p>Error OAuth: {str(oe)}</p>
 </body></html>"""
         return HTMLResponse(html_err, status_code=400)
+
     except Exception as e:
         err = json.dumps(str(e))
         html_exc = f"""
@@ -329,6 +331,7 @@ else:
 <p>Error: {str(e)}</p>
 </body></html>"""
         return HTMLResponse(html_exc, status_code=500)
+
 
 @app.post("/integrations/google/status")
 async def google_status(body: dict):
