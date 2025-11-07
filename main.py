@@ -1,257 +1,55 @@
-import os, time, json
-from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, HTTPException, Depends, Request, Query
+# main.py
+import os, json
+from fastapi import FastAPI, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from starlette.middleware.sessions import SessionMiddleware
+from starlette.responses import HTMLResponse
 from dotenv import load_dotenv
+from itsdangerous import URLSafeSerializer
 from authlib.integrations.starlette_client import OAuth
 from authlib.integrations.base_client.errors import OAuthError
-from starlette.responses import JSONResponse, HTMLResponse
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Integer, Float, Text
-from starlette.middleware.sessions import SessionMiddleware
-from itsdangerous import URLSafeSerializer
-import httpx
-# --- NUEVO: imports para cache/locks ---
-import asyncio
-from datetime import datetime, timedelta
-from collections import defaultdict
 
-from gbp_client import GBPClient
-
-# ---------------------- CONFIG ----------------------
 load_dotenv()
 
+# === ENV requeridas ===
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8001/auth/google/callback")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "https://aibetech.es")  # para CORS y postMessage
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 GOOGLE_SCOPES = os.getenv(
     "GOOGLE_OAUTH_SCOPES",
-    "https://www.googleapis.com/auth/business.manage openid email profile",
+    "openid email profile https://www.googleapis.com/auth/business.manage",
 )
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibe.db")
+# Firmar/validar el "state" (opcional pero recomendado)
+STATE_SIGNER = URLSafeSerializer(SECRET_KEY, salt="google-oauth")
 
-# Supabase (REST)
-SUPABASE_URL = os.getenv("SUPABASE_URL")  # https://xxxxx.supabase.co
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-SUPABASE_REST_URL = (SUPABASE_URL.rstrip("/") + "/rest/v1") if SUPABASE_URL else None
+# --- App base ---
+app = FastAPI(title="Minimal Google OAuth Flow")
 
-if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
-    raise RuntimeError("Faltan GOOGLE_CLIENT_ID o GOOGLE_CLIENT_SECRET en .env")
-if not (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY):
-    raise RuntimeError("Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env")
-
-STATE_SIGNER = URLSafeSerializer(os.getenv("SECRET_KEY", "dev-secret"), salt="google-oauth")
-
-BUSINESS_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
-
-GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
-
-# === NUEVO: Business Information API para LOCATIONS ===
-BUSINESS_INFO_API = "https://mybusinessbusinessinformation.googleapis.com/v1"
-
-async def gbp_info_get(access_token: str, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Helper para endpoints de Business Information (locations, etc.)
-    """
-    headers = {"Authorization": f"Bearer {access_token}"}
-    url = f"{BUSINESS_INFO_API}/{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=headers, params=params)
-        if r.status_code >= 400:
-            # Propaga detalles y Retry-After para que el caller ponga cooldown
-            detail = {
-                "status": r.status_code,
-                "url": url,
-                "body": None,
-                "retry_after": r.headers.get("Retry-After"),
-            }
-            try:
-                detail["body"] = r.json()
-            except Exception:
-                detail["body"] = r.text
-            raise HTTPException(r.status_code, detail)
-        return r.json()
-
-
-# --- NUEVO: cache y límites por usuario ---
-LOC_TTL_SECONDS = 5 * 60         # 5 min datos frescos
-STALE_GRACE_SECONDS = 10 * 60     # 10 min se permite servir stale si Google limita
-COOLDOWN_DEFAULT = 30             # si no viene Retry-After, cooldown 30s
-
-# email -> {"data": {...}, "fetched_at": datetime}
-LOCATIONS_CACHE: dict[str, dict[str, Any]] = {}
-
-# email -> timestamp (epoch) hasta cuándo hay cooldown
-USER_COOLDOWN_UNTIL: dict[str, float] = {}
-
-# locks por email para evitar martillazos concurrentes
-USER_LOCKS: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-
-# ---------------------- Supabase REST helpers ----------------------
-def sb_headers():
-    return {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-        "Content-Type": "application/json",
-    }
-
-async def upsert_google_connection_by_email(email: str, refresh_token: str, scope: Optional[str]):
-    """
-    Guarda/actualiza la conexión Google por email en tu tabla 'google_connections'
-    (asumimos que existe con columna única user_email).
-    """
-    url = f"{SUPABASE_REST_URL}/google_connections?on_conflict=user_email"
-    payload = {
-        "user_email": email,
-        "refresh_token": refresh_token,
-        "scope": scope,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-
-async def is_connected_by_email(email: str) -> bool:
-    url = f"{SUPABASE_REST_URL}/google_connections"
-    params = {
-        "user_email": f"eq.{email}",
-        "refresh_token": "not.is.null",
-        "select": "refresh_token",
-        "limit": 1,
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=sb_headers(), params=params)
-        r.raise_for_status()
-        data = r.json()
-        if not data:
-            return False
-        # asegura que el refresh_token no esté vacío
-        return bool((data[0].get("refresh_token") or "").strip())
-
-
-async def get_connection_by_email(email: str) -> Optional[Dict[str, Any]]:
-    url = f"{SUPABASE_REST_URL}/google_connections"
-    params = {"user_email": f"eq.{email}", "select": "user_email,refresh_token,scope", "limit": 1}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, headers=sb_headers(), params=params)
-        r.raise_for_status()
-        data = r.json()
-        return data[0] if data else None
-
-# ---- Upserts de negocio (ubicaciones/reseñas) ----
-async def upsert_locations(rows: List[Dict[str, Any]]):
-    if not rows:
-        return
-    url = f"{SUPABASE_REST_URL}/gbp_locations?on_conflict=name"
-    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=rows)
-        r.raise_for_status()
-
-async def upsert_reviews(rows: List[Dict[str, Any]]):
-    if not rows:
-        return
-    url = f"{SUPABASE_REST_URL}/gbp_reviews?on_conflict=review_id"
-    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=rows)
-        r.raise_for_status()
-
-async def upsert_review_replies(rows: List[Dict[str, Any]]):
-    if not rows:
-        return
-    url = f"{SUPABASE_REST_URL}/gbp_review_replies?on_conflict=review_id"
-    headers = sb_headers() | {"Prefer": "resolution=merge-duplicates"}
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(url, headers=headers, json=rows)
-        r.raise_for_status()
-
-# ---------------------- Access token via refresh token ----------------------
-async def exchange_refresh_token(refresh_token: str) -> Dict[str, Any]:
-    """
-    Intercambia el refresh_token por un access_token válido.
-    """
-    data = {
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token",
-    }
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(GOOGLE_TOKEN_ENDPOINT, data=data)
-        # Si Google devuelve 400, suele ser refresh_token caducado o inválido
-        if r.status_code >= 400:
-            raise HTTPException(status_code=401, detail=f"Error al refrescar token: {r.text}")
-        return r.json()  # {access_token, expires_in, scope, token_type}
-
-# ---------------------- Llamadas directas a GBP ----------------------
-async def gbp_get(access_token: str, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    headers = {"Authorization": f"Bearer {access_token}"}
-    url = f"{BUSINESS_API}/{path}"
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(url, headers=headers, params=params)
-        if r.status_code >= 400:
-            detail = {
-                "status": r.status_code,
-                "url": url,
-                "body": None,
-                "retry_after": r.headers.get("Retry-After"),
-            }
-            try:
-                detail["body"] = r.json()
-            except Exception:
-                detail["body"] = r.text
-            raise HTTPException(r.status_code, detail)
-        return r.json()
-
-
-# ---------------------- DATABASE (mínima local) ----------------------
-class Base(DeclarativeBase):
-    pass
-
-class OAuthToken(Base):
-    __tablename__ = "oauth_tokens"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    provider: Mapped[str] = mapped_column(String(50))
-    user_id: Mapped[str] = mapped_column(String(100), default="demo-user")
-    access_token: Mapped[str] = mapped_column(Text)
-    refresh_token: Mapped[str] = mapped_column(Text)
-    expires_at: Mapped[float] = mapped_column(Float)
-    account_json: Mapped[str] = mapped_column(Text, default="{}")
-
-engine = create_async_engine(DATABASE_URL, echo=False)
-Session = async_sessionmaker(engine, expire_on_commit=False)
-
-# ---------------------- APP ----------------------
-app = FastAPI(title="AIBE Backend")
-
-# CORS
+# CORS (ajusta origins a tu frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "https://aibetech.es",
-        "https://www.aibetech.es",   # <--- añadido
+        "https://www.aibetech.es",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Sesiones (necesarias para OAuth)
+# Sesiones para Authlib
 app.add_middleware(
     SessionMiddleware,
-    secret_key=os.getenv("SECRET_KEY", "dev-secret"),
+    secret_key=SECRET_KEY,
     same_site="lax",
 )
 
+# Authlib OAuth client
 oauth = OAuth()
 oauth.register(
     name="google",
@@ -261,98 +59,18 @@ oauth.register(
     client_kwargs={"scope": GOOGLE_SCOPES},
 )
 
-# ---------------------- HELPERS GBP (legacy deps) ----------------------
-async def get_token(session=Depends(Session)) -> OAuthToken:
-    # Mantengo este helper para no romper tus rutas existentes.
-    async with session as s:
-        res = await s.get(OAuthToken, 1)
-        if not res:
-            raise HTTPException(status_code=401, detail="No hay token. Inicia sesión con /auth/google/login")
-        return res
+@app.get("/health")
+async def health():
+    return {"ok": True}
 
-async def gbp_client(tok: OAuthToken = Depends(get_token)) -> GBPClient:
-    return GBPClient(
-        client_id=GOOGLE_CLIENT_ID,
-        client_secret=GOOGLE_CLIENT_SECRET,
-        access_token=tok.access_token,
-        refresh_token=tok.refresh_token,
-        expires_at=tok.expires_at,
-    )
-
-class ReplyBody(BaseModel):
-    account_id: str
-    location_id: str
-    review_id: str
-    reply_text: str
-
-    # --- Helper: primera página ligera para sembrar cache ---
-async def fetch_first_page_locations(access_token: str, account_name: str) -> List[Dict[str, Any]]:
-    # Reducimos pageSize para evitar límites en el primer golpe
-    params = {"pageSize": 50}  # 50-100 está bien; menos reduce prob. de 429
-    resp = await gbp_info_get(access_token, f"{account_name}/locations", params=params)
-    items = []
-    for l in resp.get("locations", []):
-        items.append({
-            "account": account_name,
-            "location": l["name"],
-            "title": l.get("title"),
-        })
-    return items
-
-# --- Job en background: completa todas las páginas y refresca cache ---
-async def refresh_locations_full(email: str, refresh_token: str) -> None:
-    try:
-        token = await exchange_refresh_token(refresh_token)
-        access_token = token["access_token"]
-    except Exception:
-        return  # si el refresh falla, salimos en silencio
-
-    aggregated: List[Dict[str, Any]] = []
-    try:
-        accounts_resp = await gbp_get(access_token, "accounts")
-        for acc in accounts_resp.get("accounts", []):
-            acc_name = acc["name"]
-            next_token = None
-            while True:
-                params = {"pageSize": 100}
-                if next_token:
-                    params["pageToken"] = next_token
-                resp = await gbp_info_get(access_token, f"{acc_name}/locations", params=params)
-                for l in resp.get("locations", []):
-                    aggregated.append({
-                        "account": acc_name,
-                        "location": l["name"],
-                        "title": l.get("title"),
-                    })
-                next_token = resp.get("nextPageToken")
-                if not next_token:
-                    break
-
-        # Actualiza cache global y Supabase
-        LOCATIONS_CACHE[email] = {
-            "data": {"items": aggregated},
-            "fetched_at": datetime.utcnow(),
-        }
-        asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in aggregated]))
-    except Exception:
-        # mejor no romper: si Google limita aquí, el front seguirá usando la cache parcial
-        return
-
-
-# ---------------------- EVENTS ----------------------
-@app.on_event("startup")
-async def on_startup():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-# ---------------------- ROUTES: OAuth ----------------------
 @app.get("/auth/google/login")
-async def google_login(request: Request, email: str = Query(..., min_length=3)):
+async def google_login(request: Request, email: str = Query("", min_length=0)):
     """
-    Inicia OAuth con Google. Firmamos el email del usuario en 'state' para recuperarlo en el callback.
+    Inicia el flujo OAuth con Google.
+    Si pasas ?email=..., lo incluimos dentro del 'state' firmado (opcional).
     """
-    email = email.strip().lower()
-    state = STATE_SIGNER.dumps({"email": email})
+    state_payload = {"email": (email or "").strip().lower()}
+    state = STATE_SIGNER.dumps(state_payload)
     return await oauth.google.authorize_redirect(
         request,
         redirect_uri=GOOGLE_REDIRECT_URI,
@@ -364,76 +82,67 @@ async def google_login(request: Request, email: str = Query(..., min_length=3)):
 
 @app.get("/auth/google/callback")
 async def google_callback(request: Request):
+    """
+    Callback de Google. No guardamos nada: solo devolvemos una página
+    que hace postMessage al opener y se cierra.
+    """
     try:
-        # 0) Intercambiar el código por tokens de Google
         token = await oauth.google.authorize_access_token(request)
-        print("Token keys:", list(token.keys()))
-
-        # 1) validar state y extraer email
+        # Si necesitas leer algo del state:
         raw_state = request.query_params.get("state")
-        data = STATE_SIGNER.loads(raw_state)  # lanza si se manipuló
-        email = (data.get("email") or "").strip().lower()
-        if not email:
-            return HTMLResponse("<p>Missing email</p>", status_code=400)
+        try:
+            state = STATE_SIGNER.loads(raw_state) if raw_state else {}
+        except Exception:
+            state = {}
 
-        # 2) tokens (refactor)
-        access_token = token.get("access_token")
-        refresh_token = token.get("refresh_token")  # puede venir None o faltar
+        # Éxito: devolvemos ok:true y (opcionalmente) algunos datos básicos
+        id_token = token.get("userinfo") or {}
+        email = (id_token.get("email") or "").lower() if isinstance(id_token, dict) else None
 
-        if not access_token:
-            html = f"""
-<!doctype html><html><body>
-<script>
-  try {{
-    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:'sin_access_token'}}, '{FRONTEND_ORIGIN}');
-  }} catch (e) {{}}
-  window.close();
-</script>
-<p>Error: Google no devolvió access_token</p>
-</body></html>"""
-            return HTMLResponse(html, status_code=400)
-
-        # 3) Guardar/actualizar conexión en Supabase por email
-        #    Solo si realmente tenemos refresh_token NO vacío
-        if refresh_token and str(refresh_token).strip():
-            await upsert_google_connection_by_email(email, refresh_token, token.get("scope"))
-        else:
-            print(f"[WARN] Google no devolvió refresh_token para {email}; no se guardará conexión.")
-
-        # 4) Avisar al opener (frontend) y cerrar el popup
         html_ok = f"""
 <!doctype html><html><body>
 <script>
   try {{
-    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:true}}, '{FRONTEND_ORIGIN}');
+    window.opener && window.opener.postMessage(
+      {{
+        type: 'oauth-complete',
+        ok: true,
+        email: {json.dumps(email)},
+      }},
+      '{FRONTEND_ORIGIN}'
+    );
   }} catch (e) {{}}
   window.close();
 </script>
 <p>Login completado. Puedes cerrar esta ventana.</p>
 </body></html>"""
         return HTMLResponse(html_ok)
-
     except OAuthError as oe:
         err = json.dumps(str(oe))
         html_err = f"""
 <!doctype html><html><body>
 <script>
   try {{
-    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, '{FRONTEND_ORIGIN}');
+    window.opener && window.opener.postMessage(
+      {{ type:'oauth-complete', ok:false, error:{err} }},
+      '{FRONTEND_ORIGIN}'
+    );
   }} catch (e) {{}}
   window.close();
 </script>
 <p>Error OAuth: {str(oe)}</p>
 </body></html>"""
         return HTMLResponse(html_err, status_code=400)
-
     except Exception as e:
         err = json.dumps(str(e))
         html_exc = f"""
 <!doctype html><html><body>
 <script>
   try {{
-    window.opener && window.opener.postMessage({{type:'oauth-complete', ok:false, error:{err}}}, '{FRONTEND_ORIGIN}');
+    window.opener && window.opener.postMessage(
+      {{ type:'oauth-complete', ok:false, error:{err} }},
+      '{FRONTEND_ORIGIN}'
+    );
   }} catch (e) {{}}
   window.close();
 </script>
@@ -441,160 +150,6 @@ async def google_callback(request: Request):
 </body></html>"""
         return HTMLResponse(html_exc, status_code=500)
 
-
-@app.post("/integrations/google/status")
-async def google_status(body: dict):
-    """
-    Devuelve si el usuario (por email) ya tiene conexión guardada en Supabase.
-    """
-    email = (body.get("email") or "").strip().lower()
-    if not email:
-        return {"connected": False}
-    connected = await is_connected_by_email(email)
-    return {"connected": connected}
-
-# ---------------------- NUEVOS ENDPOINTS CLAVE ----------------------
-@app.get("/me/gbp/locations")
-async def list_my_locations(email: str = Query(..., min_length=3)):
-    email = email.strip().lower()
-    conn = await get_connection_by_email(email)
-    if not conn or not conn.get("refresh_token"):
-        raise HTTPException(status_code=401, detail="Usuario sin conexión Google válida.")
-
-    now = datetime.utcnow()
-    lock = USER_LOCKS[email]
-
-    def respond_with_cache(status_code: int = 200, retry_after: Optional[int] = None, stale: bool = False):
-        cached = LOCATIONS_CACHE.get(email)
-        payload = {
-            "items": cached["data"]["items"] if cached else [],
-            "fromCache": True,
-            "stale": stale,
-            "fetchedAt": cached["fetched_at"].isoformat() if cached else None,
-        }
-        headers = {}
-        if retry_after is not None:
-            headers["Retry-After"] = str(retry_after)
-        return JSONResponse(payload, status_code=status_code, headers=headers)
-
-    # Si hay cooldown, sirve cache si existe
-    cooldown_until = USER_COOLDOWN_UNTIL.get(email)
-    if cooldown_until and time.time() < cooldown_until and email in LOCATIONS_CACHE:
-        retry_after = max(1, int(cooldown_until - time.time()))
-        return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
-
-    # Cache fresca
-    cached = LOCATIONS_CACHE.get(email)
-    if cached and (now - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
-        return JSONResponse({
-            "items": cached["data"]["items"],
-            "fromCache": True,
-            "stale": False,
-            "fetchedAt": cached["fetched_at"].isoformat()
-        }, status_code=200)
-
-    async with lock:
-        # Recheck dentro del lock
-        cached = LOCATIONS_CACHE.get(email)
-        if cached and (datetime.utcnow() - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
-            return JSONResponse({
-                "items": cached["data"]["items"],
-                "fromCache": True,
-                "stale": False,
-                "fetchedAt": cached["fetched_at"].isoformat()
-            }, status_code=200)
-
-        # 1) Access token
-        try:
-            token = await exchange_refresh_token(conn["refresh_token"])
-            access_token = token["access_token"]
-        except HTTPException:
-            LOCATIONS_CACHE.pop(email, None)
-            raise
-
-        # 2) Primer éxito ligero: cuentas + SOLO PRIMERA PÁGINA por cuenta
-        try:
-            seed_items: List[Dict[str, Any]] = []
-            accounts_resp = await gbp_get(access_token, "accounts")
-            for acc in accounts_resp.get("accounts", []):
-                acc_name = acc["name"]
-                # solo una página pequeña para evitar 429
-                items_fp = await fetch_first_page_locations(access_token, acc_name)
-                seed_items.extend(items_fp)
-
-            # Si conseguimos algo, sembramos cache parcial y lanzamos el full refresh en background
-            if seed_items:
-                LOCATIONS_CACHE[email] = {
-                    "data": {"items": seed_items},
-                    "fetched_at": datetime.utcnow(),
-                }
-                # Upsert parcial y job en background
-                asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in seed_items]))
-                asyncio.create_task(refresh_locations_full(email, conn["refresh_token"]))
-
-                return JSONResponse({
-                    "items": seed_items,
-                    "fromCache": False,
-                    "stale": False,
-                    "partial": True,   # <- útil para el front si quieres mostrar aviso suave
-                    "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat()
-                }, status_code=200)
-
-            # Si no hay ni cuentas ni locations, respondemos vacío
-            LOCATIONS_CACHE[email] = {
-                "data": {"items": []},
-                "fetched_at": datetime.utcnow(),
-            }
-            return JSONResponse({
-                "items": [],
-                "fromCache": False,
-                "stale": False,
-                "partial": False,
-                "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat()
-            }, status_code=200)
-
-        except HTTPException as e:
-            # 429 en el primer golpe: fija cooldown
-            if e.status_code == 429:
-                retry_after = COOLDOWN_DEFAULT
-                try:
-                    if isinstance(e.detail, dict) and e.detail.get("retry_after"):
-                        retry_after = int(e.detail["retry_after"])
-                except Exception:
-                    pass
-                USER_COOLDOWN_UNTIL[email] = time.time() + retry_after
-
-                # Si hay cache (aunque sea vieja), sírvela; si no, devolvemos 429
-                if email in LOCATIONS_CACHE:
-                    return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
-                return JSONResponse({"detail": "Upstream rate limited", "retry_after": retry_after}, status_code=429, headers={"Retry-After": str(retry_after)})
-
-            # Otros errores: sirve cache si existe
-            if email in LOCATIONS_CACHE:
-                return respond_with_cache(status_code=200, stale=True)
-            raise
-
-
-# ---------------------- GBP ROUTES (ejemplo, legado) ----------------------
-@app.get("/accounts")
-async def accounts(client: GBPClient = Depends(gbp_client)):
-    return await client.list_accounts()
-
-@app.get("/locations")
-async def locations(account_id: str, client: GBPClient = Depends(gbp_client)):
-    return await client.list_locations(account_id)
-
-@app.get("/reviews")
-async def reviews(account_id: str, location_id: str, client: GBPClient = Depends(gbp_client)):
-    return await client.list_reviews(account_id, location_id)
-
-@app.post("/reviews/reply")
-async def reply(body: ReplyBody, client: GBPClient = Depends(gbp_client)):
-    return await client.update_reply(body.account_id, body.location_id, body.review_id, body.reply_text)
-
-@app.get("/health")
-async def health():
-    return {"ok": True}
 
 
 
