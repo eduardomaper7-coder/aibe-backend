@@ -13,6 +13,10 @@ from sqlalchemy import String, Integer, Float, Text
 from starlette.middleware.sessions import SessionMiddleware
 from itsdangerous import URLSafeSerializer
 import httpx
+# --- NUEVO: imports para cache/locks ---
+import asyncio
+from datetime import datetime, timedelta
+from collections import defaultdict
 
 from gbp_client import GBPClient
 
@@ -45,6 +49,21 @@ STATE_SIGNER = URLSafeSerializer(os.getenv("SECRET_KEY", "dev-secret"), salt="go
 BUSINESS_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
 
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+# --- NUEVO: cache y límites por usuario ---
+LOC_TTL_SECONDS = 5 * 60         # 5 min datos frescos
+STALE_GRACE_SECONDS = 10 * 60     # 10 min se permite servir stale si Google limita
+COOLDOWN_DEFAULT = 30             # si no viene Retry-After, cooldown 30s
+
+# email -> {"data": {...}, "fetched_at": datetime}
+LOCATIONS_CACHE: dict[str, dict[str, Any]] = {}
+
+# email -> timestamp (epoch) hasta cuándo hay cooldown
+USER_COOLDOWN_UNTIL: dict[str, float] = {}
+
+# locks por email para evitar martillazos concurrentes
+USER_LOCKS: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 
 # ---------------------- Supabase REST helpers ----------------------
 def sb_headers():
@@ -151,10 +170,19 @@ async def gbp_get(access_token: str, path: str, params: Optional[Dict[str, Any]]
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, headers=headers, params=params)
         if r.status_code >= 400:
-            # Propaga el mensaje de Google (403, 404, etc.)
-            raise HTTPException(r.status_code, f"GBP API error {r.status_code} on {url}: {r.text}")
+            # Propaga status, body y Retry-After (si lo hay)
+            detail = {
+                "status": r.status_code,
+                "url": url,
+                "body": None,
+                "retry_after": r.headers.get("Retry-After"),  # <-- clave
+            }
+            try:
+                detail["body"] = r.json()
+            except Exception:
+                detail["body"] = r.text
+            raise HTTPException(r.status_code, detail)
         return r.json()
-
 
 # ---------------------- DATABASE (mínima local) ----------------------
 class Base(DeclarativeBase):
@@ -348,116 +376,116 @@ async def google_status(body: dict):
 @app.get("/me/gbp/locations")
 async def list_my_locations(email: str = Query(..., min_length=3)):
     """
-    Lista TODAS las ubicaciones (locations) de todas las cuentas GBP del usuario (por email)
-    y las upserta en Supabase (gbp_locations).
+    Lista TODAS las ubicaciones GBP del usuario (por email),
+    con cache por 5 min y cooldown si Google limita (429).
     """
     email = email.strip().lower()
     conn = await get_connection_by_email(email)
     if not conn or not conn.get("refresh_token"):
         raise HTTPException(status_code=401, detail="Usuario sin conexión Google válida.")
 
-    # 1) Conseguir access token
-    token = await exchange_refresh_token(conn["refresh_token"])
-    access_token = token["access_token"]
+    now = datetime.utcnow()
+    lock = USER_LOCKS[email]
 
-    # 2) Obtener cuentas y ubicaciones
-    items: List[Dict[str, Any]] = []
-    accounts_resp = await gbp_get(access_token, "accounts")
-    for acc in accounts_resp.get("accounts", []):
-        acc_name = acc["name"]  # "accounts/123..."
-        # Paginación de locations
-        next_token = None
-        while True:
-            params = {"pageSize": 100}
-            if next_token:
-                params["pageToken"] = next_token
-            locs_resp = await gbp_get(access_token, f"{acc_name}/locations", params=params)
-            locs = locs_resp.get("locations", [])
-            for l in locs:
-                items.append({
-                    "account": acc_name,
-                    "location": l["name"],         # "locations/XXXXXXXXXXXX"
-                    "title": l.get("title")
-                })
-            next_token = locs_resp.get("nextPageToken")
-            if not next_token:
-                break
+    # Helper para responder con cache (fresco o stale)
+    def respond_with_cache(status_code: int = 200, retry_after: Optional[int] = None, stale: bool = False):
+        cached = LOCATIONS_CACHE.get(email)
+        payload = {
+            "items": cached["data"]["items"] if cached else [],
+            "fromCache": True,
+            "stale": stale,
+            "fetchedAt": cached["fetched_at"].isoformat() if cached else None,
+        }
+        headers = {}
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
+        return JSONResponse(payload, status_code=status_code, headers=headers)
 
-    # 3) Upsert en Supabase (solo name+title)
-    await upsert_locations([{"name": it["location"], "title": it.get("title")} for it in items])
+    # 1) Si hay cooldown activo y tenemos cache (aunque sea stale), servimos cache
+    cooldown_until = USER_COOLDOWN_UNTIL.get(email)
+    if cooldown_until and time.time() < cooldown_until:
+        if email in LOCATIONS_CACHE:
+            # tiempo restante aproximado
+            retry_after = max(1, int(cooldown_until - time.time()))
+            return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
+        # sin cache: caemos a refresh, pero si Google devuelve 429 volveremos con 429
 
-    return {"items": items}
+    # 2) Si tenemos cache fresca, devolvemos y listo
+    cached = LOCATIONS_CACHE.get(email)
+    if cached and (now - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
+        return JSONResponse({ "items": cached["data"]["items"], "fromCache": True, "stale": False, "fetchedAt": cached["fetched_at"].isoformat() }, status_code=200)
 
-@app.post("/gbp/sync-reviews")
-async def sync_reviews(
-    email: str = Query(..., min_length=3),
-    location_name: str = Query(..., description='Ej: "locations/12345678901234567890"'),
-):
-    """
-    Sincroniza TODAS las reseñas de una ubicación concreta a Supabase (gbp_reviews / gbp_review_replies).
-    Idempotente (upsert).
-    """
-    email = email.strip().lower()
-    conn = await get_connection_by_email(email)
-    if not conn or not conn.get("refresh_token"):
-        raise HTTPException(status_code=401, detail="Usuario sin conexión Google válida.")
+    # 3) Refresco protegido por lock por usuario
+    async with lock:
+        # re-chequea cache por si otro coroutine ya la refrescó
+        cached = LOCATIONS_CACHE.get(email)
+        if cached and (datetime.utcnow() - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
+            return JSONResponse({ "items": cached["data"]["items"], "fromCache": True, "stale": False, "fetchedAt": cached["fetched_at"].isoformat() }, status_code=200)
 
-    token = await exchange_refresh_token(conn["refresh_token"])
-    access_token = token["access_token"]
+        # refrescar tokens
+        try:
+            token = await exchange_refresh_token(conn["refresh_token"])
+            access_token = token["access_token"]
+        except HTTPException as e:
+            # refresh inválido → borra cache y retorna 401
+            LOCATIONS_CACHE.pop(email, None)
+            raise
 
-    # (opcional) traer info de la location y upsert por si no existe aún
-    try:
-        loc = await gbp_get(access_token, location_name)
-        await upsert_locations([{"name": loc["name"], "title": loc.get("title")}])
-    except Exception:
-        # Si falla, seguimos igualmente con reviews; puede ser falta de permiso de lectura de location details.
-        pass
+        # 4) Llamadas a Google con control de errores/429
+        try:
+            items: List[Dict[str, Any]] = []
+            accounts_resp = await gbp_get(access_token, "accounts")
+            for acc in accounts_resp.get("accounts", []):
+                acc_name = acc["name"]
+                next_token = None
+                while True:
+                    params = {"pageSize": 100}
+                    if next_token:
+                        params["pageToken"] = next_token
+                    locs_resp = await gbp_get(access_token, f"{acc_name}/locations", params=params)
+                    locs = locs_resp.get("locations", [])
+                    for l in locs:
+                        items.append({
+                            "account": acc_name,
+                            "location": l["name"],
+                            "title": l.get("title")
+                        })
+                    next_token = locs_resp.get("nextPageToken")
+                    if not next_token:
+                        break
 
-    total = 0
-    next_token = None
-    while True:
-        params = {"pageSize": 100}
-        if next_token:
-            params["pageToken"] = next_token
-        data = await gbp_get(access_token, f"{location_name}/reviews", params=params)
+            # guarda cache y upsert a Supabase
+            LOCATIONS_CACHE[email] = {
+                "data": {"items": items},
+                "fetched_at": datetime.utcnow(),
+            }
+            # upsert asíncrono sin bloquear la respuesta
+            asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in items]))
 
-        review_rows: List[Dict[str, Any]] = []
-        reply_rows: List[Dict[str, Any]] = []
+            return JSONResponse({ "items": items, "fromCache": False, "stale": False, "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat() }, status_code=200)
 
-        for r in data.get("reviews", []):
-            name = r.get("name", "")  # "locations/xxx/reviews/YYY"
-            review_id = name.split("/")[-1] if name else None
-            if not review_id:
-                continue
-            review_rows.append({
-                "review_id": review_id,
-                "location_name": location_name,
-                "star_rating": int(r.get("starRating", 0)) if r.get("starRating") else None,
-                "comment": r.get("comment"),
-                "create_time": r.get("createTime"),
-                "update_time": r.get("updateTime"),
-                "reviewer_display_name": (r.get("reviewer") or {}).get("displayName"),
-                "is_anonymous": (r.get("reviewer") or {}).get("isAnonymous", False)
-            })
-            if "reviewReply" in r:
-                rr = r["reviewReply"]
-                reply_rows.append({
-                    "review_id": review_id,
-                    "comment": rr.get("comment"),
-                    "update_time": rr.get("updateTime"),
-                })
-            total += 1
+        except HTTPException as e:
+            # Si Google limita (429) → establece cooldown y sirve cache si hay
+            if e.status_code == 429:
+                # establece cooldown (usa Retry-After si viene en el texto, si no COOLDOWN_DEFAULT)
+                retry_after = COOLDOWN_DEFAULT
+                try:
+                    # intenta extraer Retry-After del mensaje (si lo incluyes en e.detail)
+                    retry_after = int(json.loads(str(e.detail)).get("retry_after", COOLDOWN_DEFAULT))  # best effort
+                except Exception:
+                    pass
+                USER_COOLDOWN_UNTIL[email] = time.time() + retry_after
 
-        if review_rows:
-            await upsert_reviews(review_rows)
-        if reply_rows:
-            await upsert_review_replies(reply_rows)
+                if email in LOCATIONS_CACHE:
+                    return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
+                # sin cache: devuelve 429 con Retry-After
+                return JSONResponse({"detail": "Upstream rate limited", "retry_after": retry_after}, status_code=429, headers={"Retry-After": str(retry_after)})
 
-        next_token = data.get("nextPageToken")
-        if not next_token:
-            break
+            # Otros errores de Google → sirve cache si existe (stale), si no propaga
+            if email in LOCATIONS_CACHE:
+                return respond_with_cache(status_code=200, stale=True)
+            raise
 
-    return {"synced": total}
 
 # ---------------------- GBP ROUTES (ejemplo, legado) ----------------------
 @app.get("/accounts")
