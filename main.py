@@ -50,6 +50,33 @@ BUSINESS_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
 
 GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
 
+# === NUEVO: Business Information API para LOCATIONS ===
+BUSINESS_INFO_API = "https://mybusinessbusinessinformation.googleapis.com/v1"
+
+async def gbp_info_get(access_token: str, path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Helper para endpoints de Business Information (locations, etc.)
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"{BUSINESS_INFO_API}/{path}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, headers=headers, params=params)
+        if r.status_code >= 400:
+            # Propaga detalles y Retry-After para que el caller ponga cooldown
+            detail = {
+                "status": r.status_code,
+                "url": url,
+                "body": None,
+                "retry_after": r.headers.get("Retry-After"),
+            }
+            try:
+                detail["body"] = r.json()
+            except Exception:
+                detail["body"] = r.text
+            raise HTTPException(r.status_code, detail)
+        return r.json()
+
+
 # --- NUEVO: cache y límites por usuario ---
 LOC_TTL_SECONDS = 5 * 60         # 5 min datos frescos
 STALE_GRACE_SECONDS = 10 * 60     # 10 min se permite servir stale si Google limita
@@ -170,12 +197,11 @@ async def gbp_get(access_token: str, path: str, params: Optional[Dict[str, Any]]
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(url, headers=headers, params=params)
         if r.status_code >= 400:
-            # Propaga status, body y Retry-After (si lo hay)
             detail = {
                 "status": r.status_code,
                 "url": url,
                 "body": None,
-                "retry_after": r.headers.get("Retry-After"),  # <-- clave
+                "retry_after": r.headers.get("Retry-After"),
             }
             try:
                 detail["body"] = r.json()
@@ -183,6 +209,7 @@ async def gbp_get(access_token: str, path: str, params: Optional[Dict[str, Any]]
                 detail["body"] = r.text
             raise HTTPException(r.status_code, detail)
         return r.json()
+
 
 # ---------------------- DATABASE (mínima local) ----------------------
 class Base(DeclarativeBase):
@@ -375,10 +402,6 @@ async def google_status(body: dict):
 # ---------------------- NUEVOS ENDPOINTS CLAVE ----------------------
 @app.get("/me/gbp/locations")
 async def list_my_locations(email: str = Query(..., min_length=3)):
-    """
-    Lista TODAS las ubicaciones GBP del usuario (por email),
-    con cache por 5 min y cooldown si Google limita (429).
-    """
     email = email.strip().lower()
     conn = await get_connection_by_email(email)
     if not conn or not conn.get("refresh_token"):
@@ -387,7 +410,6 @@ async def list_my_locations(email: str = Query(..., min_length=3)):
     now = datetime.utcnow()
     lock = USER_LOCKS[email]
 
-    # Helper para responder con cache (fresco o stale)
     def respond_with_cache(status_code: int = 200, retry_after: Optional[int] = None, stale: bool = False):
         cached = LOCATIONS_CACHE.get(email)
         payload = {
@@ -401,37 +423,28 @@ async def list_my_locations(email: str = Query(..., min_length=3)):
             headers["Retry-After"] = str(retry_after)
         return JSONResponse(payload, status_code=status_code, headers=headers)
 
-    # 1) Si hay cooldown activo y tenemos cache (aunque sea stale), servimos cache
     cooldown_until = USER_COOLDOWN_UNTIL.get(email)
     if cooldown_until and time.time() < cooldown_until:
         if email in LOCATIONS_CACHE:
-            # tiempo restante aproximado
             retry_after = max(1, int(cooldown_until - time.time()))
             return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
-        # sin cache: caemos a refresh, pero si Google devuelve 429 volveremos con 429
 
-    # 2) Si tenemos cache fresca, devolvemos y listo
     cached = LOCATIONS_CACHE.get(email)
     if cached and (now - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
         return JSONResponse({ "items": cached["data"]["items"], "fromCache": True, "stale": False, "fetchedAt": cached["fetched_at"].isoformat() }, status_code=200)
 
-    # 3) Refresco protegido por lock por usuario
     async with lock:
-        # re-chequea cache por si otro coroutine ya la refrescó
         cached = LOCATIONS_CACHE.get(email)
         if cached and (datetime.utcnow() - cached["fetched_at"]).total_seconds() < LOC_TTL_SECONDS:
             return JSONResponse({ "items": cached["data"]["items"], "fromCache": True, "stale": False, "fetchedAt": cached["fetched_at"].isoformat() }, status_code=200)
 
-        # refrescar tokens
         try:
             token = await exchange_refresh_token(conn["refresh_token"])
             access_token = token["access_token"]
-        except HTTPException as e:
-            # refresh inválido → borra cache y retorna 401
+        except HTTPException:
             LOCATIONS_CACHE.pop(email, None)
             raise
 
-        # 4) Llamadas a Google con control de errores/429
         try:
             items: List[Dict[str, Any]] = []
             accounts_resp = await gbp_get(access_token, "accounts")
@@ -442,7 +455,10 @@ async def list_my_locations(email: str = Query(..., min_length=3)):
                     params = {"pageSize": 100}
                     if next_token:
                         params["pageToken"] = next_token
-                    locs_resp = await gbp_get(access_token, f"{acc_name}/locations", params=params)
+
+                    # 🔁 CAMBIO AQUÍ: usamos gbp_info_get para locations
+                    locs_resp = await gbp_info_get(access_token, f"{acc_name}/locations", params=params)
+
                     locs = locs_resp.get("locations", [])
                     for l in locs:
                         items.append({
@@ -454,37 +470,35 @@ async def list_my_locations(email: str = Query(..., min_length=3)):
                     if not next_token:
                         break
 
-            # guarda cache y upsert a Supabase
             LOCATIONS_CACHE[email] = {
                 "data": {"items": items},
                 "fetched_at": datetime.utcnow(),
             }
-            # upsert asíncrono sin bloquear la respuesta
             asyncio.create_task(upsert_locations([{"name": it["location"], "title": it.get("title")} for it in items]))
 
             return JSONResponse({ "items": items, "fromCache": False, "stale": False, "fetchedAt": LOCATIONS_CACHE[email]["fetched_at"].isoformat() }, status_code=200)
 
         except HTTPException as e:
-            # Si Google limita (429) → establece cooldown y sirve cache si hay
             if e.status_code == 429:
-                # establece cooldown (usa Retry-After si viene en el texto, si no COOLDOWN_DEFAULT)
                 retry_after = COOLDOWN_DEFAULT
                 try:
-                    # intenta extraer Retry-After del mensaje (si lo incluyes en e.detail)
-                    retry_after = int(json.loads(str(e.detail)).get("retry_after", COOLDOWN_DEFAULT))  # best effort
+                    # Si e.detail es dict, mejor leerlo así:
+                    if isinstance(e.detail, dict) and e.detail.get("retry_after"):
+                        retry_after = int(e.detail["retry_after"])
+                    else:
+                        retry_after = int(json.loads(str(e.detail)).get("retry_after", COOLDOWN_DEFAULT))
                 except Exception:
                     pass
                 USER_COOLDOWN_UNTIL[email] = time.time() + retry_after
 
                 if email in LOCATIONS_CACHE:
                     return respond_with_cache(status_code=200, retry_after=retry_after, stale=True)
-                # sin cache: devuelve 429 con Retry-After
                 return JSONResponse({"detail": "Upstream rate limited", "retry_after": retry_after}, status_code=429, headers={"Retry-After": str(retry_after)})
 
-            # Otros errores de Google → sirve cache si existe (stale), si no propaga
             if email in LOCATIONS_CACHE:
                 return respond_with_cache(status_code=200, stale=True)
             raise
+
 
 
 # ---------------------- GBP ROUTES (ejemplo, legado) ----------------------
