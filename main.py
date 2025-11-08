@@ -13,9 +13,7 @@ import httpx
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import (
-    Column, String, Boolean, DateTime, Text, select, UniqueConstraint
-)
+from sqlalchemy import Column, String, Boolean, DateTime, Text, select, UniqueConstraint
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -48,10 +46,6 @@ engine = create_async_engine(DATABASE_URL, future=True, echo=False)
 async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 class GoogleOAuth(Base):
-    """
-    Tabla mínima para saber si un email ya conectó.
-    Guarda tokens (refresh) para poder usar APIs luego.
-    """
     __tablename__ = "google_oauth"
     __table_args__ = (UniqueConstraint("email", name="uq_google_oauth_email"),)
 
@@ -74,10 +68,6 @@ class GoogleOAuth(Base):
 # Utilidades
 # =========================
 def sign_state(email: str, ttl_sec: int = 600) -> str:
-    """
-    Crea un state firmado (HMAC) con email y exp.
-    Lo devolvemos URL-safe (base64).
-    """
     exp = int(time.time()) + ttl_sec
     payload = json.dumps({"email": email, "exp": exp}).encode("utf-8")
     sig = hmac.new(SECRET_KEY.encode("utf-8"), payload, hashlib.sha256).digest()
@@ -85,9 +75,6 @@ def sign_state(email: str, ttl_sec: int = 600) -> str:
     return raw
 
 def verify_state(state: str) -> str:
-    """
-    Valida el state y devuelve el email.
-    """
     try:
         raw = base64.urlsafe_b64decode(state.encode("ascii"))
         payload, sig = raw.rsplit(b".", 1)
@@ -108,10 +95,7 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 def parse_origins(s: str) -> list[str]:
-    """
-    Convierte 'a,b,c' en lista de orígenes sin barras finales.
-    Starlette hace match exacto del origin; el slash final no debe estar.
-    """
+    """Convierte 'a,b,c' en lista de orígenes sin barras finales."""
     out = []
     for part in s.split(","):
         o = part.strip()
@@ -131,15 +115,30 @@ ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN_RAW)
 if not ALLOWED_ORIGINS:
     ALLOWED_ORIGINS = ["http://localhost:3000"]
 
+# Opción A: lista exacta (recomendada)
+USE_REGEX = False
+# Opción B: regex flexible (activar si quieres cubrir subdominios)
+# USE_REGEX = True
+# ORIGIN_REGEX = r"https?://(localhost(:\d+)?|([a-zA-Z0-9-]+\.)*aibetech\.es)$"
+
 print(f"🔐 CORS allow_origins = {ALLOWED_ORIGINS}")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,     # No usar "*" si allow_credentials=True
-    allow_credentials=True,            # si en el front usas credentials:'include'
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
+if USE_REGEX:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=ORIGIN_REGEX,
+        allow_credentials=True,
+        allow_methods=["GET","POST","OPTIONS"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,   # No usar "*" con allow_credentials=True
+        allow_credentials=True,
+        allow_methods=["GET","POST","OPTIONS"],
+        allow_headers=["*"],
+    )
 
 async def get_db() -> AsyncSession:
     async with async_session() as s:
@@ -166,7 +165,6 @@ async def google_login(email: str = Query(..., description="Email del usuario qu
         raise HTTPException(400, "email requerido")
 
     state = sign_state(email)
-    # Codifica el scope correctamente
     scope_param = urllib.parse.quote(SCOPES, safe="")
     auth_url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
@@ -174,9 +172,9 @@ async def google_login(email: str = Query(..., description="Email del usuario qu
         f"&redirect_uri={urllib.parse.quote(GOOGLE_REDIRECT_URI, safe='')}"
         f"&response_type=code"
         f"&scope={scope_param}"
-        f"&access_type=offline"          # refresh_token
+        f"&access_type=offline"
         f"&include_granted_scopes=true"
-        f"&prompt=consent"               # asegura refresh_token la primera vez
+        f"&prompt=consent"
         f"&state={urllib.parse.quote(state, safe='')}"
     )
     return RedirectResponse(auth_url, status_code=302)
@@ -190,7 +188,6 @@ async def google_callback(
     db: AsyncSession = Depends(get_db),
 ):
     if error:
-        # Devuelve HTML que informa al opener
         html = f"""
         <script>
           window.opener && window.opener.postMessage({{ type:'oauth-complete', ok:false, error: {json.dumps(error)} }}, '*');
@@ -204,7 +201,6 @@ async def google_callback(
 
     email = verify_state(state)
 
-    # Intercambiar code por tokens
     token_url = "https://oauth2.googleapis.com/token"
     data = {
         "code": code,
@@ -226,11 +222,9 @@ async def google_callback(
     expires_in = tok.get("expires_in", 3600)
     id_token = tok.get("id_token")
 
-    # Parse "sub" del id_token (si viene)
     google_account_id = None
     if id_token:
         try:
-            # id_token es un JWT. No lo validamos criptográficamente aquí; solo decodificamos el payload.
             payload = id_token.split(".")[1] + "=="
             payload_bytes = base64.urlsafe_b64decode(payload.encode("ascii"))
             sub = json.loads(payload_bytes.decode("utf-8")).get("sub")
@@ -239,7 +233,6 @@ async def google_callback(
         except Exception:
             pass
 
-    # Upsert
     expires_at = utcnow() + timedelta(seconds=int(expires_in))
     existing = (await db.execute(select(GoogleOAuth).where(GoogleOAuth.email == email))).scalars().first()
     if existing:
@@ -266,7 +259,6 @@ async def google_callback(
         db.add(rec)
     await db.commit()
 
-    # Cierra el popup avisando al opener
     html = """
     <html><body>
     <script>
@@ -290,13 +282,8 @@ async def google_status(email: str = Query(...), db: AsyncSession = Depends(get_
 
 @app.get("/me/gbp/locations")
 async def gbp_locations(email: str = Query(...), db: AsyncSession = Depends(get_db)):
-    """
-    Endpoint placeholder para el frontend: devuelve 200 si el email ya está conectado.
-    Sustituye el contenido por tu llamada real a la API de Google Business Profile.
-    """
     email = email.lower().strip()
     row = (await db.execute(select(GoogleOAuth).where(GoogleOAuth.email == email))).scalars().first()
     if not row or not row.connected:
         raise HTTPException(status_code=401, detail="Not connected")
-    # 200 OK con una lista vacía por ahora
     return {"locations": [], "connected": True}
