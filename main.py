@@ -1,176 +1,272 @@
-# main.py
-import os, json, time
-from fastapi import FastAPI, Request, Query, Depends, HTTPException
+# aibe-backend/main.py
+import base64
+import hashlib
+import hmac
+import json
+import os
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, Depends, HTTPException, Query, Response, Request
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.middleware.sessions import SessionMiddleware
-from starlette.responses import HTMLResponse, JSONResponse
-from dotenv import load_dotenv
-from itsdangerous import URLSafeSerializer
-from authlib.integrations.starlette_client import OAuth
-from authlib.integrations.base_client.errors import OAuthError
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import (
+    Column, String, Boolean, Integer, DateTime, Text, select, UniqueConstraint
+)
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# === NUEVO: DB ===
-from aibe-backend.db import Base, engine, get_session
-from aibe-backend.models import User
-
-load_dotenv()
-
-# === ENV requeridas ===
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+# =========================
+# Config desde variables .env
+# =========================
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8001/auth/google/callback")
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
-GOOGLE_SCOPES = os.getenv("GOOGLE_OAUTH_SCOPES", "openid email profile https://www.googleapis.com/auth/business.manage")
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibe.db")
 
-STATE_SIGNER = URLSafeSerializer(SECRET_KEY, salt="google-oauth")
+# Scopes (espacios separados). Ej: "openid email profile https://www.googleapis.com/auth/business.manage"
+SCOPES_STR = os.getenv(
+    "GOOGLE_OAUTH_SCOPES",
+    "openid email profile https://www.googleapis.com/auth/business.manage",
+)
+SCOPES = " ".join(SCOPES_STR.split())  # sanea espacios repetidos
 
-app = FastAPI(title="Minimal Google OAuth Flow")
+if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+    print("⚠️  Faltan GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET en .env")
+
+# =========================
+# DB (SQLAlchemy async)
+# =========================
+Base = declarative_base()
+engine = create_async_engine(DATABASE_URL, future=True, echo=False)
+async_session = sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
+
+class GoogleOAuth(Base):
+    """
+    Tabla mínima para saber si un email ya conectó.
+    Guarda tokens (refresh) para poder usar APIs luego.
+    """
+    __tablename__ = "google_oauth"
+    __table_args__ = (UniqueConstraint("email", name="uq_google_oauth_email"),)
+
+    email = Column(String(320), primary_key=True)  # email en minúsculas
+    google_account_id = Column(String(64), nullable=True)  # "sub" del id_token
+    connected = Column(Boolean, default=False, nullable=False)
+
+    access_token = Column(Text, nullable=True)
+    refresh_token = Column(Text, nullable=True)
+    token_type = Column(String(32), nullable=True)
+    scope = Column(Text, nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)  # UTC
+
+    id_token = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                        onupdate=lambda: datetime.now(timezone.utc), nullable=False)
+
+# =========================
+# Utilidades
+# =========================
+def sign_state(email: str, ttl_sec: int = 600) -> str:
+    """
+    Crea un state firmado (HMAC) con email y exp.
+    Lo devolvemos URL-safe (base64).
+    """
+    exp = int(time.time()) + ttl_sec
+    payload = json.dumps({"email": email, "exp": exp}).encode("utf-8")
+    sig = hmac.new(SECRET_KEY.encode("utf-8"), payload, hashlib.sha256).digest()
+    raw = base64.urlsafe_b64encode(payload + b"." + sig).decode("ascii")
+    return raw
+
+def verify_state(state: str) -> str:
+    """
+    Valida el state y devuelve el email.
+    """
+    try:
+        raw = base64.urlsafe_b64decode(state.encode("ascii"))
+        payload, sig = raw.rsplit(b".", 1)
+        exp_data = json.loads(payload.decode("utf-8"))
+        expected = hmac.new(SECRET_KEY.encode("utf-8"), payload, hashlib.sha256).digest()
+        if not hmac.compare_digest(sig, expected):
+            raise ValueError("invalid signature")
+        if int(exp_data["exp"]) < int(time.time()):
+            raise ValueError("expired")
+        email = (exp_data["email"] or "").lower()
+        if not email:
+            raise ValueError("missing email")
+        return email
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid state: {e}")
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+# =========================
+# App
+# =========================
+app = FastAPI(title="AIBE Backend", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "https://aibetech.es",
-        "https://www.aibetech.es",
-    ],
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, same_site="lax")
+async def get_db() -> AsyncSession:
+    async with async_session() as s:
+        yield s
 
-oauth = OAuth()
-oauth.register(
-    name="google",
-    client_id=GOOGLE_CLIENT_ID,
-    client_secret=GOOGLE_CLIENT_SECRET,
-    server_metadata_url="https://accounts.google.com/.well-known/openid-configuration",
-    client_kwargs={"scope": GOOGLE_SCOPES},
-)
-
-# === Crear tablas al arrancar ===
 @app.on_event("startup")
 async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    print("✅ DB lista")
+
+# =========================
+# Rutas
+# =========================
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "ts": int(time.time())}
 
-# ---- Endpoint: estado conexión por email ----
-@app.get("/auth/google/status")
-async def google_status(email: str = Query(..., min_length=3), session: AsyncSession = Depends(get_session)):
-    q = await session.execute(select(User).where(User.email == email.lower()))
-    user = q.scalar_one_or_none()
-    return {"connected": bool(user and user.google_connected)}
-
-# ---- Inicia OAuth ----
 @app.get("/auth/google/login")
-async def google_login(request: Request, email: str = Query("", min_length=0)):
-    state_payload = {"email": (email or "").strip().lower()}
-    state = STATE_SIGNER.dumps(state_payload)
-    return await oauth.google.authorize_redirect(
-        request,
-        redirect_uri=GOOGLE_REDIRECT_URI,
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-        state=state,
+async def google_login(email: str = Query(..., description="Email del usuario que inicia OAuth")):
+    email = email.lower().strip()
+    if not email:
+        raise HTTPException(400, "email requerido")
+
+    state = sign_state(email)
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={GOOGLE_CLIENT_ID}"
+        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&response_type=code"
+        f"&scope={httpx.QueryParams({'scope': SCOPES}).get('scope')}"
+        f"&access_type=offline"          # refresh_token
+        f"&include_granted_scopes=true"
+        f"&prompt=consent"               # asegura refresh_token la primera vez
+        f"&state={state}"
     )
+    return RedirectResponse(auth_url, status_code=302)
 
-# ---- Callback: guarda en BD y cierra popup ----
 @app.get("/auth/google/callback")
-async def google_callback(request: Request, session: AsyncSession = Depends(get_session)):
-    try:
-        token = await oauth.google.authorize_access_token(request)
-        # Leer state
-        raw_state = request.query_params.get("state")
+async def google_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+    if error:
+        # Devuelve HTML que informa al opener
+        html = f"""
+        <script>
+          window.opener && window.opener.postMessage({{ type:'oauth-complete', ok:false, error: {json.dumps(error)} }}, '*');
+          window.close();
+        </script>
+        """
+        return HTMLResponse(html)
+
+    if not code or not state:
+        raise HTTPException(400, "Falta code/state")
+
+    email = verify_state(state)
+
+    # Intercambiar code por tokens
+    token_url = "https://oauth2.googleapis.com/token"
+    data = {
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(token_url, data=data, headers={"Content-Type": "application/x-www-form-urlencoded"})
+    if r.status_code != 200:
+        raise HTTPException(400, f"Token exchange failed: {r.text}")
+
+    tok = r.json()
+    access_token = tok.get("access_token")
+    refresh_token = tok.get("refresh_token")  # puede venir vacío si ya concedido antes
+    token_type = tok.get("token_type")
+    scope = tok.get("scope")
+    expires_in = tok.get("expires_in", 3600)
+    id_token = tok.get("id_token")
+
+    # Parse "sub" del id_token (si viene)
+    google_account_id = None
+    if id_token:
         try:
-            state = STATE_SIGNER.loads(raw_state) if raw_state else {}
+            # id_token es un JWT. No lo validamos criptográficamente aquí; solo decodificamos el payload.
+            payload = id_token.split(".")[1] + "=="
+            payload_bytes = base64.urlsafe_b64decode(payload.encode("ascii"))
+            sub = json.loads(payload_bytes.decode("utf-8")).get("sub")
+            if sub:
+                google_account_id = str(sub)
         except Exception:
-            state = {}
+            pass
 
-        # Datos del usuario
-        userinfo = token.get("userinfo") or {}
-        email = (userinfo.get("email") or "").lower() if isinstance(userinfo, dict) else None
-        sub = userinfo.get("sub") if isinstance(userinfo, dict) else None
+    # Upsert
+    expires_at = utcnow() + timedelta(seconds=int(expires_in))
+    existing = (await db.execute(select(GoogleOAuth).where(GoogleOAuth.email == email))).scalars().first()
+    if existing:
+        existing.connected = True
+        existing.access_token = access_token or existing.access_token
+        existing.refresh_token = refresh_token or existing.refresh_token
+        existing.token_type = token_type
+        existing.scope = scope
+        existing.expires_at = expires_at
+        existing.id_token = id_token or existing.id_token
+        existing.google_account_id = google_account_id or existing.google_account_id
+    else:
+        rec = GoogleOAuth(
+            email=email,
+            connected=True,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_type=token_type,
+            scope=scope,
+            expires_at=expires_at,
+            id_token=id_token,
+            google_account_id=google_account_id,
+        )
+        db.add(rec)
+    await db.commit()
 
-        # Preferimos el email del state si existe y es válido
-        email = (state.get("email") or email or "").lower()
-        if not email:
-            raise HTTPException(status_code=400, detail="No se obtuvo email del usuario")
+    # Cierra el popup avisando al opener
+    html = """
+    <html><body>
+    <script>
+      try {
+        window.opener && window.opener.postMessage({ type:'oauth-complete', ok:true }, '*');
+      } catch (e) {}
+      window.close();
+    </script>
+    Conexión completada. Puedes cerrar esta ventana.
+    </body></html>
+    """
+    return HTMLResponse(html)
 
-        # Upsert usuario
-        q = await session.execute(select(User).where(User.email == email))
-        user = q.scalar_one_or_none()
-        if not user:
-            user = User(email=email)
+@app.get("/auth/google/status")
+async def google_status(email: str = Query(...), db: AsyncSession = Depends(get_db)):
+    email = email.lower().strip()
+    if not email:
+        raise HTTPException(400, "email requerido")
+    row = (await db.execute(select(GoogleOAuth).where(GoogleOAuth.email == email))).scalars().first()
+    return {"connected": bool(row and row.connected)}
 
-        user.google_connected = True
-        user.google_sub = sub
-        user.google_email = email
-        user.access_token = token.get("access_token")
-        user.refresh_token = token.get("refresh_token") or user.refresh_token  # puede no venir en reconsent
-        user.token_type = token.get("token_type")
-        # authlib normalmente trae expires_at (epoch) o expires_in
-        expires_at = token.get("expires_at")
-        if not expires_at and token.get("expires_in"):
-            expires_at = int(time.time()) + int(token["expires_in"])
-        user.expires_at = expires_at
+@app.get("/me/gbp/locations")
+async def gbp_locations(email: str = Query(...), db: AsyncSession = Depends(get_db)):
+    """
+    Endpoint placeholder para el frontend: devuelve 200 si el email ya está conectado.
+    Sustituye el contenido por tu llamada real a la API de Google Business Profile.
+    """
+    email = email.lower().strip()
+    row = (await db.execute(select(GoogleOAuth).where(GoogleOAuth.email == email))).scalars().first()
+    if not row or not row.connected:
+        raise HTTPException(status_code=401, detail="Not connected")
+    # 200 OK con una lista vacía por ahora
+    return {"locations": [], "connected": True}
 
-        session.add(user)
-        await session.commit()
-
-        # Popup: notifica al opener y cierra
-        html_ok = f"""
-<!doctype html><html><body>
-<script>
-  try {{
-    window.opener && window.opener.postMessage(
-      {{ type:'oauth-complete', ok:true, email:{json.dumps(email)} }},
-      '{FRONTEND_ORIGIN}'
-    );
-  }} catch (e) {{}}
-  window.close();
-</script>
-<p>Login completado. Puedes cerrar esta ventana.</p>
-</body></html>"""
-        return HTMLResponse(html_ok)
-    except OAuthError as oe:
-        err = json.dumps(str(oe))
-        html_err = f"""
-<!doctype html><html><body>
-<script>
-  try {{
-    window.opener && window.opener.postMessage(
-      {{ type:'oauth-complete', ok:false, error:{err} }},
-      '{FRONTEND_ORIGIN}'
-    );
-  }} catch (e) {{}}
-  window.close();
-</script>
-<p>Error OAuth: {str(oe)}</p>
-</body></html>"""
-        return HTMLResponse(html_err, status_code=400)
-    except Exception as e:
-        err = json.dumps(str(e))
-        html_exc = f"""
-<!doctype html><html><body>
-<script>
-  try {{
-    window.opener && window.opener.postMessage(
-      {{ type:'oauth-complete', ok:false, error:{err} }},
-      '{FRONTEND_ORIGIN}'
-    );
-  }} catch (e) {{}}
-  window.close();
-</script>
-<p>Error: {str(e)}</p>
-</body></html>"""
-        return HTMLResponse(html_exc, status_code=500)
