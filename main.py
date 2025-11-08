@@ -5,15 +5,16 @@ import hmac
 import json
 import os
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
-from fastapi import FastAPI, Depends, HTTPException, Query, Response, Request
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (
-    Column, String, Boolean, Integer, DateTime, Text, select, UniqueConstraint
+    Column, String, Boolean, DateTime, Text, select, UniqueConstraint
 )
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -24,7 +25,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://127.0.0.1:8001/auth/google/callback")
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+# Puede ser una lista separada por comas: "http://localhost:3000,https://aibetech.es"
+FRONTEND_ORIGIN_RAW = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 SECRET_KEY = os.getenv("SECRET_KEY", "change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./aibe.db")
 
@@ -105,15 +107,36 @@ def verify_state(state: str) -> str:
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+def parse_origins(s: str) -> list[str]:
+    """
+    Convierte 'a,b,c' en lista de orígenes sin barras finales.
+    Starlette hace match exacto del origin; el slash final no debe estar.
+    """
+    out = []
+    for part in s.split(","):
+        o = part.strip()
+        if o.endswith("/"):
+            o = o[:-1]
+        if o:
+            out.append(o)
+    return out
+
 # =========================
 # App
 # =========================
 app = FastAPI(title="AIBE Backend", version="1.0.0")
 
+# ---- CORS: múltiples orígenes (localhost + producción) ----
+ALLOWED_ORIGINS = parse_origins(FRONTEND_ORIGIN_RAW)
+if not ALLOWED_ORIGINS:
+    ALLOWED_ORIGINS = ["http://localhost:3000"]
+
+print(f"🔐 CORS allow_origins = {ALLOWED_ORIGINS}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN],
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,     # No usar "*" si allow_credentials=True
+    allow_credentials=True,            # si en el front usas credentials:'include'
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -143,21 +166,29 @@ async def google_login(email: str = Query(..., description="Email del usuario qu
         raise HTTPException(400, "email requerido")
 
     state = sign_state(email)
+    # Codifica el scope correctamente
+    scope_param = urllib.parse.quote(SCOPES, safe="")
     auth_url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
         f"?client_id={GOOGLE_CLIENT_ID}"
-        f"&redirect_uri={GOOGLE_REDIRECT_URI}"
+        f"&redirect_uri={urllib.parse.quote(GOOGLE_REDIRECT_URI, safe='')}"
         f"&response_type=code"
-        f"&scope={httpx.QueryParams({'scope': SCOPES}).get('scope')}"
+        f"&scope={scope_param}"
         f"&access_type=offline"          # refresh_token
         f"&include_granted_scopes=true"
         f"&prompt=consent"               # asegura refresh_token la primera vez
-        f"&state={state}"
+        f"&state={urllib.parse.quote(state, safe='')}"
     )
     return RedirectResponse(auth_url, status_code=302)
 
 @app.get("/auth/google/callback")
-async def google_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+async def google_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
     if error:
         # Devuelve HTML que informa al opener
         html = f"""
@@ -269,4 +300,3 @@ async def gbp_locations(email: str = Query(...), db: AsyncSession = Depends(get_
         raise HTTPException(status_code=401, detail="Not connected")
     # 200 OK con una lista vacía por ahora
     return {"locations": [], "connected": True}
-
