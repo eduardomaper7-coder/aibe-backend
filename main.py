@@ -72,6 +72,10 @@ USE_MOCK_GBP = os.getenv("USE_MOCK_GBP", "true").lower() == "true"
 # =========================
 app = FastAPI(title="AIBE Backend", version="1.0.0")
 
+@app.get("/")
+def root():
+    return {"ok": True}
+
 # =========================
 # Startup: OpenAI client
 # =========================
