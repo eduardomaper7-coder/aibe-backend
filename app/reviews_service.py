@@ -83,13 +83,16 @@ def scrape_and_store(
     max_reviews: int,
     personal_data: bool,
 ) -> tuple[ScrapeJob, int]:
-
+    
+    google_maps_url = google_maps_url.strip()
     # -------------------------------------------------
     # 0) Resolver URLs cortas de Google Maps (móvil)
     # -------------------------------------------------
     if "maps.app.goo.gl" in google_maps_url:
         google_maps_url = expand_google_maps_short_url(google_maps_url)
-
+    
+    print("🔗 Google Maps URL final:", google_maps_url)
+    
     if not is_valid_google_maps_url(google_maps_url):
         raise ValueError(
             "URL no válida de Google Maps (debe ser /maps/place, /maps/reviews o /maps/search)."
