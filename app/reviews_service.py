@@ -3,6 +3,7 @@ import os
 import csv
 from datetime import datetime
 from sqlalchemy.orm import Session
+import requests
 
 from app.apify_client import ApifyWrapper
 from app.config import settings
@@ -68,6 +69,14 @@ def export_job_reviews(job_id: int, items: list[dict]) -> tuple[str, str]:
 
     return json_path, csv_path
 
+def expand_google_maps_short_url(url: str) -> str:
+    try:
+        resp = requests.get(url, allow_redirects=True, timeout=10)
+        return resp.url
+    except Exception:
+        raise ValueError("No se pudo resolver la URL corta de Google Maps")
+
+
 def scrape_and_store(
     db: Session,
     google_maps_url: str,
@@ -75,13 +84,19 @@ def scrape_and_store(
     personal_data: bool,
 ) -> tuple[ScrapeJob, int]:
 
+    # -------------------------------------------------
+    # 0) Resolver URLs cortas de Google Maps (móvil)
+    # -------------------------------------------------
+    if "maps.app.goo.gl" in google_maps_url:
+        google_maps_url = expand_google_maps_short_url(google_maps_url)
+
     if not is_valid_google_maps_url(google_maps_url):
         raise ValueError(
             "URL no válida de Google Maps (debe ser /maps/place, /maps/reviews o /maps/search)."
         )
 
     # ---------------------------
-    # 0) Identificar el local
+    # 1) Identificar el local
     # ---------------------------
     info = parse_google_maps_url(google_maps_url)
     place_key = build_place_key(info)
@@ -92,9 +107,8 @@ def scrape_and_store(
         or info.get("query_text")
     )
 
-
     # ---------------------------
-    # 1) ¿Ya existe este local?
+    # 2) ¿Ya existe este local?
     # ---------------------------
     existing_job = (
         db.query(ScrapeJob)
@@ -112,12 +126,12 @@ def scrape_and_store(
         return existing_job, saved
 
     # ---------------------------
-    # 2) Crear job nuevo
+    # 3) Crear job nuevo
     # ---------------------------
     job = ScrapeJob(
         google_maps_url=google_maps_url,
         place_key=place_key,
-        place_name=place_name,  # ✅ AQUÍ
+        place_name=place_name,
         actor_id=settings.APIFY_ACTOR_ID,
         status="running",
     )
@@ -128,7 +142,7 @@ def scrape_and_store(
 
     try:
         # ---------------------------
-        # 3) Ejecutar Apify
+        # 4) Ejecutar Apify
         # ---------------------------
         apify = ApifyWrapper()
         run, items = apify.run_reviews_actor(
@@ -142,7 +156,7 @@ def scrape_and_store(
         db.add(job)
 
         # ---------------------------
-        # 4) Guardar reseñas
+        # 5) Guardar reseñas
         # ---------------------------
         saved = 0
         for item in items:
@@ -162,7 +176,7 @@ def scrape_and_store(
         db.commit()
 
         # ---------------------------
-        # 5) Export opcional
+        # 6) Export opcional
         # ---------------------------
         export_job_reviews(job.id, items)
 
