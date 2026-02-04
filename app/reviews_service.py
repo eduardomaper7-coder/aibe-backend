@@ -4,7 +4,7 @@ import csv
 from datetime import datetime
 from sqlalchemy.orm import Session
 import requests
-
+from typing import Optional
 from app.apify_client import ApifyWrapper
 from app.config import settings
 from app.models import ScrapeJob, Review
@@ -82,17 +82,19 @@ def scrape_and_store(
     google_maps_url: str,
     max_reviews: int,
     personal_data: bool,
+    place_name: Optional[str] = None,   # ✅ nuevo
 ) -> tuple[ScrapeJob, int]:
-    
+
     google_maps_url = google_maps_url.strip()
+
     # -------------------------------------------------
     # 0) Resolver URLs cortas de Google Maps (móvil)
     # -------------------------------------------------
     if "maps.app.goo.gl" in google_maps_url:
         google_maps_url = expand_google_maps_short_url(google_maps_url)
-    
+
     print("🔗 Google Maps URL final:", google_maps_url)
-    
+
     if not is_valid_google_maps_url(google_maps_url):
         raise ValueError(
             "URL no válida de Google Maps (debe ser /maps/place, /maps/reviews o /maps/search)."
@@ -104,11 +106,31 @@ def scrape_and_store(
     info = parse_google_maps_url(google_maps_url)
     place_key = build_place_key(info)
 
-    place_name = (
-        info.get("place_name")
-        or info.get("name")
-        or info.get("query_text")
+    # ✅ NUEVO: evitar guardar place_id / URLs como nombre
+    def looks_like_place_id_or_url(v: str) -> bool:
+        s = (v or "").strip()
+        return (
+            s.startswith("http")
+            or s.startswith("place_id:")
+            or ("place_id:" in s)
+            or ("google.com/maps" in s)
+        )
+
+    incoming = (place_name or "").strip()
+
+    fallback_candidates = [
+        info.get("place_name"),
+        info.get("name"),
+        info.get("query_text"),
+    ]
+
+    fallback = next(
+        (x for x in fallback_candidates if x and not looks_like_place_id_or_url(str(x))),
+        None
     )
+
+    # ✅ prioridad: nombre del usuario si es válido; si no, fallback válido
+    place_name = incoming if (incoming and not looks_like_place_id_or_url(incoming)) else fallback
 
     # ---------------------------
     # 2) ¿Ya existe este local?
@@ -120,6 +142,13 @@ def scrape_and_store(
     )
 
     if existing_job:
+        # ✅ NUEVO: si llega un nombre bueno del frontend, actualiza el job existente
+        if place_name and existing_job.place_name != place_name:
+            existing_job.place_name = place_name
+            db.add(existing_job)
+            db.commit()
+            db.refresh(existing_job)
+
         saved = (
             db.query(Review)
             .filter(Review.job_id == existing_job.id)

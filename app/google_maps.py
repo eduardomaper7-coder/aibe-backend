@@ -1,31 +1,46 @@
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 import re
 import urllib.parse
 
 
 def is_valid_google_maps_url(url: str) -> bool:
     """
-    Validación mínima:
+    Validación flexible:
     - dominio contiene google
-    - path contiene /maps/
-    - y subpath típico: /maps/place | /maps/reviews | /maps/search
+    - acepta:
+        /maps/place
+        /maps/reviews
+        /maps/search
+        /maps?cid=XXXX
     """
     try:
         u = urlparse(url)
         host = (u.netloc or "").lower()
         path = (u.path or "").lower()
+        qs = parse_qs(u.query)
 
+        # Dominio válido
         if "google" not in host:
             return False
+
+        # ✅ Caso: https://www.google.com/maps?cid=XXXX
+        if "/maps" in path and "cid" in qs:
+            return True
+
+        # Debe contener /maps/
         if "/maps/" not in path:
             return False
+
+        # Subrutas válidas
         if not (
             "/maps/place" in path
             or "/maps/reviews" in path
             or "/maps/search" in path
         ):
             return False
+
         return True
+
     except Exception:
         return False
 
@@ -66,7 +81,12 @@ def parse_google_maps_url(url: str) -> dict:
     if not info["query_text"] and "q" in qs:
         info["query_text"] = qs["q"][0].strip()
 
+    # ✅ Extra: si viene por cid, guarda algo estable
+    if not info["query_text"] and "cid" in qs:
+        info["query_text"] = f"cid:{qs['cid'][0]}"
+
     return info
+
 
 def build_place_key(info: dict) -> str:
     """
@@ -74,4 +94,5 @@ def build_place_key(info: dict) -> str:
     """
     if info.get("lat") and info.get("lon"):
         return f"{info.get('query_text','').lower()}::{info['lat']}::{info['lon']}"
-    return info.get("query_text", "").lower()
+
+    return (info.get("query_text") or "").lower()
