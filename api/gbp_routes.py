@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import requests
 from sqlalchemy.orm import Session
-import func
+from sqlalchemy import func
 
 
 from app.db import get_db
