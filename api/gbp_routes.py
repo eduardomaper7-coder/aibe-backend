@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import requests
 from sqlalchemy.orm import Session
+import func
 
 
 from app.db import get_db
@@ -228,6 +229,12 @@ def auto_job(
             params=params,
         )
 
+        print("📦 Google reviews:", {
+            "count": len(data.get("reviews", [])),
+            "has_next": bool(data.get("nextPageToken")),
+            "location": location_name,
+        })
+
         reviews = data.get("reviews", []) or []
         for r in reviews:
             rating = star_to_int(r.get("starRating"))
@@ -255,6 +262,8 @@ def auto_job(
     job.status = "done"
     db.add(job)
     db.commit()
+    
+    print("✅ TOTAL SAVED:", saved)
 
     return {
         "job_id": job.id,
@@ -308,3 +317,20 @@ def last_job(
     )
 
     return {"job_id": job.id if job else None}
+
+
+@router.get("/job-stats/{job_id}")
+def job_stats(job_id: int, db: Session = Depends(get_db)):
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado")
+
+    total_reviews = db.query(func.count(Review.id)).filter(Review.job_id == job_id).scalar() or 0
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "place_name": job.place_name,
+        "location_name": getattr(job, "google_maps_url", None),
+        "reviews_saved": total_reviews,
+    }
