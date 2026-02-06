@@ -54,6 +54,8 @@ Base.metadata.create_all(bind=engine)
 
 from api.gbp_routes import router as gbp_router
 
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import Security
 
 
 # =========================
@@ -79,6 +81,7 @@ USE_MOCK_GBP = os.getenv("USE_MOCK_GBP", "true").lower() == "true"
 # App
 # =========================
 app = FastAPI(title="AIBE Backend", version="1.0.0")
+security = HTTPBearer()
 
 @app.get("/")
 def root():
