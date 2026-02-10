@@ -56,7 +56,9 @@ from api.gbp_routes import router as gbp_router
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
-
+from fastapi import Header, HTTPException
+import os
+from db import get_db  # o como lo tengas
 
 # =========================
 # Config desde variables .env
@@ -1392,3 +1394,25 @@ def get_job_meta(job_id: int, db: Session = Depends(get_db)):
         "place_name": job.place_name
     }
 
+
+@app.get("/admin/debug/google-oauth")
+def debug_google_oauth(x_admin_key: str = Header(None)):
+    if x_admin_key != os.getenv("ADMIN_KEY"):
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    db = get_db()
+    rows = db.execute("""
+        SELECT email, google_account_id, connected, expires_at
+        FROM google_oauth
+        ORDER BY email
+    """).fetchall()
+
+    return [
+        {
+            "email": r[0],
+            "google_account_id": r[1],
+            "connected": r[2],
+            "expires_at": r[3],
+        }
+        for r in rows
+    ]
