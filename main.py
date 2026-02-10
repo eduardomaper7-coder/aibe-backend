@@ -5,23 +5,21 @@ import sys
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 import json
-import os
 from dotenv import load_dotenv
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict
 from supabase_client import supabase
 import requests
+from app.db import Base, engine, get_db
 
 from urllib.parse import urlparse, parse_qs
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Request
+
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -34,7 +32,6 @@ from typing import Literal
 from pydantic import BaseModel, HttpUrl
 from typing import List
 
-from fastapi import FastAPI, HTTPException
 
 from typing import Optional, List, Dict, Any
 
@@ -351,15 +348,13 @@ async def run_flow_for_user(
             return datetime.fromisoformat(v.replace("Z", "+00:00"))
 
         all_reviews = load_mock_reviews()
+        
+        reviews = all_reviews
 
         # --- FILTRO: solo reseñas de los últimos 30 días ---
         cutoff = datetime.now(timezone.utc) - timedelta(days=30)
 
-        for r in rows:
-            dt = parse_dt_safe(r.published_at) or parse_dt_safe(getattr(r, "created_at", None))
-
-            if not dt or dt < cutoff:
-                continue
+        
 
         # ---------------------------------------------------
 
@@ -531,7 +526,6 @@ from datetime import datetime, date
 from collections import defaultdict
 
 from app.models import Review
-from db import Base, engine, get_db
 print("🧩 DB URL:", engine.url)
 
 
