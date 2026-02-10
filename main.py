@@ -41,8 +41,7 @@ from typing import Optional, List, Dict, Any
 
 from sqlalchemy.orm import Session
 
-from app.db import Base, engine, get_db
-print("🧩 DB URL:", engine.url)
+
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
 from app.models import ScrapeJob, Review
 from app.reviews_service import scrape_and_store
@@ -50,7 +49,7 @@ from app.models_analysis_cache import AnalysisCache
 from app.models_ai_reply_cache import ReviewAIReply
 
 Base.metadata.create_all(bind=engine)
-
+from sqlalchemy import text
 
 from api.gbp_routes import router as gbp_router
 
@@ -58,7 +57,6 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security
 from fastapi import Header, HTTPException
 import os
-from db import get_db  # o como lo tengas
 
 # =========================
 # Config desde variables .env
@@ -532,8 +530,9 @@ from sqlalchemy.orm import Session
 from datetime import datetime, date
 from collections import defaultdict
 
-from app.db import get_db
 from app.models import Review
+from db import Base, engine, get_db
+print("🧩 DB URL:", engine.url)
 
 
 @app.get("/reviews/sentiment-summary")
@@ -1394,18 +1393,20 @@ def get_job_meta(job_id: int, db: Session = Depends(get_db)):
         "place_name": job.place_name
     }
 
-
 @app.get("/admin/debug/google-oauth")
-def debug_google_oauth(x_admin_key: str = Header(None)):
+def debug_google_oauth(
+    x_admin_key: str = Header(None),
+    db: Session = Depends(get_db),
+):
     if x_admin_key != os.getenv("ADMIN_KEY"):
         raise HTTPException(status_code=403, detail="forbidden")
 
-    db = get_db()
-    rows = db.execute("""
+    result = db.execute(text("""
         SELECT email, google_account_id, connected, expires_at
         FROM google_oauth
         ORDER BY email
-    """).fetchall()
+    """))
+    rows = result.fetchall()
 
     return [
         {
