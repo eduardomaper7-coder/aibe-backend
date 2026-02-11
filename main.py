@@ -1,4 +1,3 @@
-# aibe-backend/main.py (parte superior)
 import asyncio
 import sys
 
@@ -6,41 +5,29 @@ if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import os
-from dotenv import load_dotenv
 from pathlib import Path
+from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
-
+load_dotenv()  # ✅ Railway friendly
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 import json
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-from supabase_client import supabase
+
 import requests
+from supabase_client import supabase
 from app.db import Base, engine, get_db
 
 from urllib.parse import urlparse, parse_qs
-
-
 from fastapi.middleware.cors import CORSMiddleware
-
-
 from openai import OpenAI
 
 from collections import defaultdict
-from typing import Literal
-
+from typing import Literal, Optional, List, Dict, Any
 from pydantic import BaseModel, HttpUrl
-from typing import List
-
-
-from typing import Optional, List, Dict, Any
-
-
 from sqlalchemy.orm import Session
-
 
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
 from app.models import ScrapeJob, Review
@@ -49,14 +36,10 @@ from app.models_analysis_cache import AnalysisCache
 from app.models_ai_reply_cache import ReviewAIReply
 
 from sqlalchemy import text
-
 from api.gbp_routes import router as gbp_router
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi import Security
-from fastapi import Header, HTTPException
-import os
-
+from fastapi import Security, Header
 
 
 print("DEBUG OPENAI_API_KEY:", "OK" if os.getenv("OPENAI_API_KEY") else "MISSING")
