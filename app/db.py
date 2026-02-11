@@ -6,7 +6,14 @@ from typing import Generator
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/app.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///./data/app.db"
+
+# ✅ Railway/Heroku suelen dar postgres:// (SQLAlchemy prefiere postgresql+psycopg2://)
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
 # ✅ Railway: si llega async por error, conviértelo a sync
 if DATABASE_URL.startswith("sqlite+aiosqlite://"):
@@ -33,6 +40,7 @@ SessionLocal = sessionmaker(
 )
 
 Base = declarative_base()
+
 
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
