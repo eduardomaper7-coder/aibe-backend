@@ -7,7 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import GoogleOAuth
-from .config import get_settings
+from api.config import get_settings
+
 
 router = APIRouter(prefix="/auth/google", tags=["auth-google"])
 settings = get_settings()
