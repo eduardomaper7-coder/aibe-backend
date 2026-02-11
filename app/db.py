@@ -1,19 +1,35 @@
+# db.py (SYNC - estable para Railway)
+
+import os
+from typing import Generator
+
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, DeclarativeBase
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-from .config import settings
 
-engine = create_engine(
-    settings.DATABASE_URL,
-    connect_args={"check_same_thread": False} if settings.DATABASE_URL.startswith("sqlite") else {},
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./data/app.db"
 )
 
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    pool_pre_ping=True,
+    future=True,
+)
 
-class Base(DeclarativeBase):
-    pass
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    future=True,
+)
 
-def get_db():
+Base = declarative_base()
+
+
+def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
