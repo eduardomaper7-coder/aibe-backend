@@ -1,3 +1,4 @@
+
 import asyncio
 import sys
 
@@ -28,6 +29,7 @@ from collections import defaultdict
 from typing import Literal, Optional, List, Dict, Any
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy.orm import Session
+from api.google_oauth import router as google_oauth_router
 
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
 from app.models import ScrapeJob, Review
@@ -83,7 +85,6 @@ def startup_event():
     print("✅ DB ready:", engine.url)
 
 import re
-import urllib.parse
 
 
 
@@ -98,7 +99,7 @@ app.add_middleware(
 
 
 app.include_router(gbp_router)
-
+app.include_router(google_oauth_router)
 
 # =========================
 # Rutas
@@ -434,11 +435,11 @@ async def run_flow_for_user(
 
 
 
-
-    """
-    Endpoint para tu sección "Últimas respuestas enviadas".
-    Devuelve solo las respuestas relacionadas con el owner_id del email.
-    """
+@app.get("/reviews/latest-replies")
+def latest_replies(
+    email: str = Query(...),
+    limit: int = Query(20, ge=1, le=100),
+):
     if supabase is None:
         raise HTTPException(500, "Supabase no configurado")
 
@@ -446,58 +447,41 @@ async def run_flow_for_user(
     if not email:
         raise HTTPException(400, "email requerido")
 
-    try:
-        # 1) Buscar el owner_id en profiles
-        profile_resp = (
-            supabase.table("profiles")
-            .select("id")
-            .eq("email", email)
-            .single()
-            .execute()
-        )
-    except Exception as e:
-        print("❌ Error consultando profiles:", repr(e))
-        raise HTTPException(500, f"Error consultando profiles: {e}")
+    # 1) Buscar el owner_id en profiles
+    profile_resp = (
+        supabase.table("profiles")
+        .select("id")
+        .eq("email", email)
+        .single()
+        .execute()
+    )
 
     if not profile_resp or not profile_resp.data:
-        # Si no hay perfil, no devolvemos nada
-        print("⚠️ No se encontró profile para", email)
         return []
 
     owner_id = profile_resp.data.get("id")
     if not owner_id:
-        print("⚠️ profile sin id para", email)
         return []
 
-    try:
-        # 2) Obtener las últimas respuestas de ese owner
-        # OJO: la tabla no tiene created_at, solo update_time
-        resp = (
-            supabase.table("gbp_review_replies")
-            .select("review_id, reply_text, status, update_time")
-            .eq("owner_id", owner_id)
-            .order("update_time", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        rows = resp.data or []
+    # 2) Obtener las últimas respuestas de ese owner
+    resp = (
+        supabase.table("gbp_review_replies")
+        .select("review_id, reply_text, status, update_time")
+        .eq("owner_id", owner_id)
+        .order("update_time", desc=True)
+        .limit(limit)
+        .execute()
+    )
 
-        # Añadimos un campo created_at sintético para que el frontend pueda usarlo
-        from datetime import datetime, timezone
+    rows = resp.data or []
 
-        for r in rows:
-            if not r.get("created_at"):
-                r["created_at"] = r.get("update_time") or datetime.now(
-                    timezone.utc
-                ).isoformat()
+    # 3) created_at sintético (frontend)
+    for r in rows:
+        if not r.get("created_at"):
+            r["created_at"] = r.get("update_time")
 
-    except Exception as e:
-        print("❌ Error consultando gbp_review_replies:", repr(e))
-        raise HTTPException(500, f"Error consultando replies: {e}")
-
-
-    print(f"✅ latest_replies: email={email}, owner_id={owner_id}, rows={len(rows)}")
     return rows
+
 
 from typing import Literal
 
@@ -1391,3 +1375,4 @@ def debug_google_oauth(
     except Exception as e:
         print("❌ debug_google_oauth error:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
+
