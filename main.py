@@ -5,11 +5,15 @@ import sys
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
-load_dotenv()
+import os
+from dotenv import load_dotenv
+from pathlib import Path
+
+load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
 
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
 import json
-from dotenv import load_dotenv
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
@@ -23,7 +27,6 @@ from urllib.parse import urlparse, parse_qs
 from fastapi.middleware.cors import CORSMiddleware
 
 
-from pathlib import Path
 from openai import OpenAI
 
 from collections import defaultdict
@@ -45,7 +48,6 @@ from app.reviews_service import scrape_and_store
 from app.models_analysis_cache import AnalysisCache
 from app.models_ai_reply_cache import ReviewAIReply
 
-Base.metadata.create_all(bind=engine)
 from sqlalchemy import text
 
 from api.gbp_routes import router as gbp_router
@@ -55,11 +57,7 @@ from fastapi import Security
 from fastapi import Header, HTTPException
 import os
 
-# =========================
-# Config desde variables .env
-# =========================
-from pathlib import Path
-load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
 
 print("DEBUG OPENAI_API_KEY:", "OK" if os.getenv("OPENAI_API_KEY") else "MISSING")
 
@@ -93,12 +91,13 @@ def startup_event():
     if not api_key:
         print("⚠️  OPENAI_API_KEY no configurada")
         app.state.openai_client = None
-        return
+    else:
+        app.state.openai_client = OpenAI(api_key=api_key)
+        print("✅ OpenAI client inicializado")
 
-    app.state.openai_client = OpenAI(api_key=api_key)
-    print("✅ OpenAI client inicializado")
-
-
+    # ✅ crea tablas aquí (NO arriba)
+    Base.metadata.create_all(bind=engine)
+    print("✅ DB ready:", engine.url)
 
 import re
 import urllib.parse
