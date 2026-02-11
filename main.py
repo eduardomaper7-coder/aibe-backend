@@ -1377,19 +1377,17 @@ def debug_google_oauth(
     if x_admin_key != os.getenv("ADMIN_KEY"):
         raise HTTPException(status_code=403, detail="forbidden")
 
-    result = db.execute(text("""
-        SELECT email, google_account_id, connected, expires_at
-        FROM google_oauth
-        ORDER BY email
-    """))
-    rows = result.fetchall()
-
-    return [
-        {
-            "email": r[0],
-            "google_account_id": r[1],
-            "connected": r[2],
-            "expires_at": r[3],
-        }
-        for r in rows
-    ]
+    try:
+        result = db.execute(text("""
+            SELECT email, google_account_id, connected, expires_at
+            FROM google_oauth
+            ORDER BY email
+        """))
+        rows = result.fetchall()
+        return [
+            {"email": r[0], "google_account_id": r[1], "connected": r[2], "expires_at": r[3]}
+            for r in rows
+        ]
+    except Exception as e:
+        print("❌ debug_google_oauth error:", repr(e))
+        raise HTTPException(status_code=500, detail=str(e))
