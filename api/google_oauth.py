@@ -15,20 +15,34 @@ settings = get_settings()
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+
+
+def _require(value: str, name: str) -> str:
+    v = (value or "").strip()
+    if not v:
+        raise HTTPException(status_code=500, detail=f"Falta configuración: {name}")
+    return v
 
 
 def get_google_auth_url(state: str) -> str:
+    client_id = _require(getattr(settings, "GOOGLE_CLIENT_ID", ""), "GOOGLE_CLIENT_ID")
+    redirect_uri = _require(getattr(settings, "GOOGLE_REDIRECT_URI", ""), "GOOGLE_REDIRECT_URI")
+
+    # scopes: si no existe en config, usa uno por defecto
+    scopes = getattr(settings, "GOOGLE_OAUTH_SCOPES", "") or "openid email profile"
+
     params = {
-        "client_id": settings.google_client_id,
-        "redirect_uri": settings.google_redirect_uri,
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
         "response_type": "code",
-        "scope": settings.google_oauth_scopes,
+        "scope": scopes,
         "access_type": "offline",
         "prompt": "consent",
         "include_granted_scopes": "true",
         "state": state,
     }
-    return "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return GOOGLE_AUTH_URL + "?" + urlencode(params)
 
 
 @router.get("/login")
@@ -43,12 +57,21 @@ async def google_callback(
     state: str,
     db: Session = Depends(get_db),
 ):
+    client_id = _require(getattr(settings, "GOOGLE_CLIENT_ID", ""), "GOOGLE_CLIENT_ID")
+    client_secret = _require(getattr(settings, "GOOGLE_CLIENT_SECRET", ""), "GOOGLE_CLIENT_SECRET")
+    redirect_uri = _require(getattr(settings, "GOOGLE_REDIRECT_URI", ""), "GOOGLE_REDIRECT_URI")
+
+    scopes = getattr(settings, "GOOGLE_OAUTH_SCOPES", "") or "openid email profile"
+    frontend_post_login_url = getattr(settings, "FRONTEND_POST_LOGIN_URL", "") or getattr(
+        settings, "FRONTEND_POST_LOGIN_UR", ""  # por si lo tienes mal escrito en Railway
+    )
+
     # 1) code -> tokens
     data = {
         "code": code,
-        "client_id": settings.google_client_id,
-        "client_secret": settings.google_client_secret,
-        "redirect_uri": settings.google_redirect_uri,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
         "grant_type": "authorization_code",
     }
 
@@ -56,8 +79,10 @@ async def google_callback(
         token_resp = await client.post(GOOGLE_TOKEN_URL, data=data)
 
     if token_resp.status_code != 200:
-        # útil para debug
-        raise HTTPException(status_code=400, detail={"msg": "Error intercambiando code", "data": token_resp.text})
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "Error intercambiando code", "data": token_resp.text},
+        )
 
     tokens = token_resp.json()
     access_token = tokens.get("access_token")
@@ -74,7 +99,10 @@ async def google_callback(
         )
 
     if userinfo_resp.status_code != 200:
-        raise HTTPException(status_code=400, detail={"msg": "Error userinfo", "data": userinfo_resp.text})
+        raise HTTPException(
+            status_code=400,
+            detail={"msg": "Error userinfo", "data": userinfo_resp.text},
+        )
 
     userinfo = userinfo_resp.json()
     email = (userinfo.get("email") or "").lower().strip()
@@ -90,19 +118,20 @@ async def google_callback(
         if refresh_token:
             row.refresh_token = refresh_token
         row.google_user_id = google_id
-        row.scope = settings.google_oauth_scopes
+        row.scope = scopes
         row.connected = True
     else:
         if not refresh_token:
             # primer login y no tenemos refresh => no podemos hacer sync
-            # redirige al front con error
-            return RedirectResponse(f"{settings.frontend_post_login_url}?error=no_refresh_token")
+            if frontend_post_login_url:
+                return RedirectResponse(f"{frontend_post_login_url}?error=no_refresh_token")
+            raise HTTPException(status_code=400, detail="No refresh_token en primer login")
 
         row = GoogleOAuth(
             email=email,
             refresh_token=refresh_token,
             google_user_id=google_id,
-            scope=settings.google_oauth_scopes,
+            scope=scopes,
             connected=True,
         )
         db.add(row)
@@ -110,5 +139,8 @@ async def google_callback(
     db.commit()
 
     # 4) Volver al frontend
-    # (Si quieres pasar email al front para /gbp/sync, puedes añadirlo)
-    return RedirectResponse(settings.frontend_post_login_url)
+    if not frontend_post_login_url:
+        # si no hay front, no rompas: devuelve algo útil
+        return {"ok": True, "email": email, "connected": True, "state": state}
+
+    return RedirectResponse(frontend_post_login_url)
