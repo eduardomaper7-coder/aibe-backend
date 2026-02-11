@@ -1,4 +1,5 @@
-# aibe-backend/db.py (SYNC)
+# app/db.py  (SYNC - Railway safe)
+
 import os
 from typing import Generator
 
@@ -8,29 +9,90 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 def _normalize_database_url(url: str) -> str:
     url = (url or "").strip()
-    if not url:
-        return "sqlite:///./aibe.db"
 
-    # Heroku-style
+    # Fallback local
+    if not url:
+        return "sqlite:///./data/app.db"
+
+    # Railway / Heroku legacy
     if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
+        url = url.replace(
+            "postgres://",
+            "postgresql+psycopg2://",
+            1,
+        )
+
+    # Railway new format
+    if url.startswith("postgresql://"):
+        url = url.replace(
+            "postgresql://",
+            "postgresql+psycopg2://",
+            1,
+        )
+
+    # SQLite async → sync
+    if url.startswith("sqlite+aiosqlite://"):
+        url = url.replace(
+            "sqlite+aiosqlite://",
+            "sqlite://",
+            1,
+        )
 
     return url
 
 
-DATABASE_URL = _normalize_database_url(os.getenv("DATABASE_URL", "sqlite:///./aibe.db"))
-
-engine = create_engine(
-    DATABASE_URL,
-    echo=False,
-    future=True,
-    pool_pre_ping=True,
+# --------------------------------------------------
+# Load + normalize
+# --------------------------------------------------
+DATABASE_URL = _normalize_database_url(
+    os.getenv("DATABASE_URL", "")
 )
 
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+print("🧩 DB URL (db.py):", DATABASE_URL)
+
+
+# --------------------------------------------------
+# SQLite special args
+# --------------------------------------------------
+connect_args = {}
+
+if DATABASE_URL.startswith("sqlite://"):
+    connect_args = {
+        "check_same_thread": False
+    }
+
+
+# --------------------------------------------------
+# Engine
+# --------------------------------------------------
+engine = create_engine(
+    DATABASE_URL,
+    connect_args=connect_args,
+    pool_pre_ping=True,
+    future=True,
+)
+
+
+# --------------------------------------------------
+# Session
+# --------------------------------------------------
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    future=True,
+)
+
+
+# --------------------------------------------------
+# Base
+# --------------------------------------------------
 Base = declarative_base()
 
 
+# --------------------------------------------------
+# Dependency
+# --------------------------------------------------
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
