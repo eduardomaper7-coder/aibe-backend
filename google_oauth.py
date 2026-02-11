@@ -1,9 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from urllib.parse import urlencode
 import httpx
+
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.models import GoogleOAuth
 from .config import get_settings
-from .supabase_client import supabase
+
 
 router = APIRouter()
 settings = get_settings()
@@ -26,20 +31,22 @@ def get_google_auth_url(state: str) -> str:
 async def google_login(user_id: str):
     """
     El front llama a /auth/google/login?user_id=<uuid>
-    y nosotros guardamos ese user_id en el parámetro state.
     """
     url = get_google_auth_url(state=user_id)
     return RedirectResponse(url)
 
 
 @router.get("/callback")
-async def google_callback(code: str, state: str, response: Response):
+async def google_callback(
+    code: str,
+    state: str,
+    db: Session = Depends(get_db),
+):
     """
     Google redirige aquí con ?code=...&state=<user_id>
     """
-    user_id = state  # en el MVP asumimos que state = uuid de Supabase
 
-    # Intercambiamos code por tokens
+    # 1️⃣ Intercambiar code → tokens
     data = {
         "code": code,
         "client_id": settings.google_client_id,
@@ -49,21 +56,24 @@ async def google_callback(code: str, state: str, response: Response):
     }
 
     async with httpx.AsyncClient() as client:
-        token_resp = await client.post("https://oauth2.googleapis.com/token", data=data)
+        token_resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data=data,
+            timeout=20
+        )
+
     if token_resp.status_code != 200:
-        raise HTTPException(status_code=400, detail="Error al intercambiar el código por tokens")
+        raise HTTPException(400, "Error intercambiando código")
 
     tokens = token_resp.json()
+
     access_token = tokens.get("access_token")
     refresh_token = tokens.get("refresh_token")
-    id_token = tokens.get("id_token")
 
     if not refresh_token:
-        # Google a veces no envía refresh_token si el usuario ya dio consentimiento.
-        # En producción deberías gestionar esto (pedir prompt=consent, etc.)
-        raise HTTPException(status_code=400, detail="No se recibió refresh_token")
+        raise HTTPException(400, "No se recibió refresh_token")
 
-    # Obtenemos email e id de Google con id_token
+    # 2️⃣ Obtener userinfo
     async with httpx.AsyncClient() as client:
         userinfo_resp = await client.get(
             "https://www.googleapis.com/oauth2/v3/userinfo",
@@ -71,20 +81,34 @@ async def google_callback(code: str, state: str, response: Response):
         )
 
     if userinfo_resp.status_code != 200:
-        raise HTTPException(status_code=400, detail="No se pudieron obtener los datos del usuario")
+        raise HTTPException(400, "Error userinfo")
 
     userinfo = userinfo_resp.json()
-    email = userinfo.get("email")
-    google_user_id = userinfo.get("sub")
 
-    # Guardamos/actualizamos conexión en Supabase
-    supabase.table("google_connections").upsert({
-        "user_email": email,
-        "google_user_id": google_user_id,
-        "refresh_token": refresh_token,
-        "scope": settings.google_oauth_scopes,
-        "user_id": user_id,
-    }, on_conflict="user_email").execute()
+    email = (userinfo.get("email") or "").lower().strip()
+    google_id = userinfo.get("sub")
 
-    # Puedes poner cookies/sesión aquí si quieres
+    if not email:
+        raise HTTPException(400, "No email")
+
+    # 3️⃣ Guardar en Postgres
+    row = db.query(GoogleOAuth).filter_by(email=email).first()
+
+    if row:
+        row.refresh_token = refresh_token
+        row.google_user_id = google_id
+        row.scope = settings.google_oauth_scopes
+        row.connected = True
+    else:
+        row = GoogleOAuth(
+            email=email,
+            refresh_token=refresh_token,
+            google_user_id=google_id,
+            scope=settings.google_oauth_scopes,
+        )
+        db.add(row)
+
+    db.commit()
+
+    # 4️⃣ Volver al frontend
     return RedirectResponse(settings.frontend_post_login_url)

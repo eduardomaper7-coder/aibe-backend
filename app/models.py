@@ -2,6 +2,9 @@ from sqlalchemy import String, Integer, DateTime, Text, JSON, ForeignKey, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
 
+from sqlalchemy import Boolean, Text
+from datetime import datetime
+from sqlalchemy.sql import func
 
 class ScrapeJob(Base):
     __tablename__ = "scrape_jobs"
@@ -52,3 +55,32 @@ class Review(Base):
     raw: Mapped[dict] = mapped_column(JSON, nullable=False)
 
     job: Mapped["ScrapeJob"] = relationship(back_populates="reviews")
+
+
+
+
+class GoogleOAuth(Base):
+    __tablename__ = "google_oauth"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    email: Mapped[str] = mapped_column(String, unique=True, index=True, nullable=False)
+
+    refresh_token: Mapped[str] = mapped_column(Text, nullable=False)
+
+    google_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    scope: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    connected: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now()
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        onupdate=func.now(),
+        server_default=func.now()
+    )
