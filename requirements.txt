@@ -7,4 +7,4 @@ SQLAlchemy==2.0.32
 supabase==2.5.1
 openai==1.51.0
 requests==2.32.3
-aiosqlite==0.20.0
+python-dotenv==1.0.1

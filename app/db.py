@@ -1,4 +1,4 @@
-# db.py (SYNC - estable para Railway)
+# app/db.py  (SYNC ONLY - Railway safe)
 
 import os
 from typing import Generator
@@ -11,6 +11,9 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "sqlite:///./data/app.db"
 )
+
+print("🧩 DB URL (db.py):", DATABASE_URL)
+
 
 engine = create_engine(
     DATABASE_URL,
