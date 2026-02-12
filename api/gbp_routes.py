@@ -287,19 +287,30 @@ def auto_job(
 
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 
-def google_get_userinfo(access_token: str) -> dict:
+def google_get(url: str, access_token: str, params=None):
     r = requests.get(
-        GOOGLE_USERINFO_URL,
+        url,
         headers={"Authorization": f"Bearer {access_token}"},
-        timeout=20,
+        params=params or {},
+        timeout=30,
     )
+
+    print("🟣 GOOGLE GET:", r.status_code, url, "params=", params)
+    print("🟣 GOOGLE RAW TEXT (first 500):", (r.text or "")[:500])
+
     if r.status_code != 200:
         try:
             detail = r.json()
         except Exception:
             detail = r.text
         raise HTTPException(status_code=r.status_code, detail=detail)
-    return r.json()
+
+    try:
+        return r.json()
+    except Exception:
+        # Si Google devuelve algo no-JSON, lo verás arriba
+        return {}
+
 
 @router.get("/last-job")
 def last_job(
