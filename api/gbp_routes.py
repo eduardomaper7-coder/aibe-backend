@@ -233,6 +233,12 @@ def auto_job(
             params=params,
         )
 
+        # 🔎 DEBUG DURO – confirma que Google responde algo real
+        print("🔵 GOOGLE REVIEWS RAW RESPONSE:", data)
+        print("🔵 GOOGLE REVIEWS RESPONSE KEYS:", list(data.keys()))
+        print("🔵 GOOGLE REVIEWS COUNT:", len(data.get("reviews", []) or []))
+        print("🔵 GOOGLE NEXT PAGE TOKEN:", data.get("nextPageToken"))
+
         print("📦 Google reviews:", {
             "count": len(data.get("reviews", [])),
             "has_next": bool(data.get("nextPageToken")),
