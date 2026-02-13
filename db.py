@@ -99,3 +99,8 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+# ✅ Importa modelos para que SQLAlchemy los registre en Base.metadata
+# (IMPORTANTE: al final para evitar imports circulares)
+from app.models import ScrapeJob, Review  # noqa: F401
+from app.review_requests.models import ReviewRequest, BusinessSettings  # noqa: F401
