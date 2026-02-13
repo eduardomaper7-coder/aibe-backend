@@ -1,14 +1,16 @@
-# app/review_requests/repo.py
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Optional
+import re
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 
 from .models import ReviewRequest, ReviewRequestStatus, BusinessSettings
 from .utils import utcnow
+
+from app.models import ScrapeJob, Review
 
 
 def create_review_request(
@@ -110,3 +112,60 @@ def upsert_business_settings(
 
 def get_business_settings(db: Session, *, job_id: int) -> Optional[BusinessSettings]:
     return db.get(BusinessSettings, job_id)
+
+
+def get_stats(db: Session, *, job_id: int):
+    sent_count = db.execute(
+        select(func.count(ReviewRequest.id))
+        .where(ReviewRequest.job_id == job_id)
+        .where(ReviewRequest.status == ReviewRequestStatus.sent)
+    ).scalar() or 0
+
+    first_sent_at = db.execute(
+        select(func.min(ReviewRequest.sent_at))
+        .where(ReviewRequest.job_id == job_id)
+        .where(ReviewRequest.status == ReviewRequestStatus.sent)
+    ).scalar()
+
+    reviews_gained = 0
+    if first_sent_at:
+        # published_at es string ISO en tu Review; comparamos por prefijo fecha si hace falta.
+        # Mejor: si published_at viene tipo "2026-02-12..." hacemos comparación string.
+        # Para hacerlo robusto, asumimos que published_at empieza con ISO.
+        iso = first_sent_at.isoformat()
+        reviews_gained = db.execute(
+            select(func.count(Review.id))
+            .where(Review.job_id == job_id)
+            .where(Review.published_at >= iso)
+        ).scalar() or 0
+
+    conversion = (reviews_gained / sent_count) if sent_count > 0 else 0.0
+
+    return {
+        "messages_sent": int(sent_count),
+        "reviews_gained": int(reviews_gained),
+        "conversion_rate": float(conversion),
+    }
+
+
+PLACE_ID_RE = re.compile(r"place_id:([A-Za-z0-9_-]+)")
+
+def ensure_review_url(db: Session, *, job_id: int) -> None:
+    bs = db.get(BusinessSettings, job_id)
+    if not bs:
+        return
+    if bs.google_review_url:
+        return
+
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+    if not job:
+        return
+
+    url = getattr(job, "google_maps_url", None) or ""
+    m = PLACE_ID_RE.search(url)
+    if not m:
+        return
+
+    place_id = m.group(1)
+    bs.google_review_url = f"https://search.google.com/local/writereview?placeid={place_id}"
+    db.commit()
