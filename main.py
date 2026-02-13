@@ -101,6 +101,9 @@ app.add_middleware(
 app.include_router(gbp_router)
 app.include_router(google_oauth_router)
 
+from app.review_requests.router import router as review_requests_router
+app.include_router(review_requests_router)
+
 # =========================
 # Rutas
 # =========================

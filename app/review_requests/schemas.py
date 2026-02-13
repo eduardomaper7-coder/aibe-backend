@@ -1,0 +1,67 @@
+# app/review_requests/schemas.py
+from datetime import datetime
+from typing import Optional, Literal
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class ReviewRequestCreate(BaseModel):
+    job_id: int
+    customer_name: str = Field(min_length=1, max_length=200)
+    phone_e164: str = Field(min_length=8, max_length=32)
+    appointment_at: datetime
+
+    @field_validator("phone_e164")
+    @classmethod
+    def validate_phone(cls, v: str) -> str:
+        # Formato recomendado: +34XXXXXXXXX
+        v = v.strip()
+        if not v.startswith("+"):
+            raise ValueError("El teléfono debe estar en formato E.164, por ejemplo +34699111222")
+        # No hacemos regex ultra estricta para no bloquear, pero validamos básico:
+        digits = v[1:].replace(" ", "")
+        if not digits.isdigit():
+            raise ValueError("El teléfono E.164 solo debe contener dígitos tras el +")
+        if len(digits) < 8 or len(digits) > 15:
+            raise ValueError("Longitud E.164 inválida (8-15 dígitos)")
+        return v
+
+
+class ReviewRequestOut(BaseModel):
+    id: int
+    job_id: int
+    customer_name: str
+    phone_e164: str
+    appointment_at: datetime
+    send_at: datetime
+    status: Literal["scheduled", "sent", "cancelled", "failed"]
+    sent_at: Optional[datetime] = None
+    cancelled_at: Optional[datetime] = None
+    error_message: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ReviewRequestListOut(BaseModel):
+    items: list[ReviewRequestOut]
+
+
+class CancelOut(BaseModel):
+    ok: bool
+    status: str
+
+
+class BusinessSettingsUpsert(BaseModel):
+    job_id: int
+    google_review_url: Optional[str] = None
+    business_name: Optional[str] = None
+
+
+class BusinessSettingsOut(BaseModel):
+    job_id: int
+    google_review_url: Optional[str] = None
+    business_name: Optional[str] = None
+
+    class Config:
+        from_attributes = True
