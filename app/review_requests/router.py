@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-
+from .sender import process_pending
 from db import SessionLocal  # ajusta si tu sesión se llama diferente
 
 from .schemas import (
@@ -107,3 +107,7 @@ def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_d
 @router.get("/review-requests/stats")
 def stats(job_id: int = Query(...), db: Session = Depends(get_db)):
     return repo.get_stats(db, job_id=job_id)
+
+@router.post("/review-requests/send-due")
+def send_due(db: Session = Depends(get_db)):
+    return process_pending(db)
