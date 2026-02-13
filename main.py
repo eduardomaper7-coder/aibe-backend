@@ -30,7 +30,6 @@ from typing import Literal, Optional, List, Dict, Any
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy.orm import Session
 from api.google_oauth import router as google_oauth_router
-from app.review_requests import models as _rr_models  # noqa: F401
 
 
 
@@ -66,6 +65,17 @@ USE_MOCK_GBP = os.getenv("USE_MOCK_GBP", "true").lower() == "true"
 app = FastAPI(title="AIBE Backend", version="1.0.0")
 security = HTTPBearer()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://www.aibetech.es",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.get("/")
 def root():
     return {"ok": True}
@@ -75,15 +85,10 @@ def root():
 # =========================
 @app.on_event("startup")
 def startup_event():
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("⚠️  OPENAI_API_KEY no configurada")
-        app.state.openai_client = None
-    else:
-        app.state.openai_client = OpenAI(api_key=api_key)
-        print("✅ OpenAI client inicializado")
+    # ✅ IMPORTAR MODELOS AQUÍ (para registrar tablas)
+    from app import models as _models  # ScrapeJob, Review, etc.
+    from app.review_requests import models as _rr_models  # ReviewRequest, BusinessSettings
 
-    # ✅ crea tablas aquí (NO arriba)
     Base.metadata.create_all(bind=engine)
     print("✅ DB ready:", engine.url)
 
@@ -91,14 +96,7 @@ import re
 
 
 
-# ✅ CORS SIEMPRE PRIMERO
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # 👈 DEV ONLY
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 
 app.include_router(gbp_router)
