@@ -4,7 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from .sender import process_pending
-from db import SessionLocal  # ajusta si tu sesión se llama diferente
+from app.db import get_db
 
 from .schemas import (
     ReviewRequestCreate,
@@ -20,12 +20,8 @@ from . import repo
 router = APIRouter(prefix="/api", tags=["review-requests"])
 
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
+
 
 
 @router.post("/review-requests", response_model=ReviewRequestOut)

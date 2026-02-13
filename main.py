@@ -30,7 +30,7 @@ from typing import Literal, Optional, List, Dict, Any
 from pydantic import BaseModel, HttpUrl
 from sqlalchemy.orm import Session
 from api.google_oauth import router as google_oauth_router
-from app.review_requests import models as _review_requests_models  # noqa: F401
+from app.review_requests import models as _rr_models  # noqa: F401
 
 
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
