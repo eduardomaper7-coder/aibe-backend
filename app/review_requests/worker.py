@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 import time
 
-from db import SessionLocal, engine, Base  # ajusta si Base/engine están en otro sitio
+from app.db import SessionLocal, engine, Base
+
 
 from . import repo
 from .twilio_service import send_whatsapp_message
