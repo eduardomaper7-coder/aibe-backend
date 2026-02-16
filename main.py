@@ -69,12 +69,18 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://www.aibetech.es",
+        "https://aibetech.es",
         "http://localhost:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 
 @app.get("/")
 def root():
