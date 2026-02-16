@@ -1,8 +1,12 @@
 # app/review_requests/schemas.py
+from __future__ import annotations
+
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
+
+from .models import ReviewRequestStatus  # ✅ IMPORTANTE: usa el Enum real
 
 
 class ReviewRequestCreate(BaseModel):
@@ -14,11 +18,9 @@ class ReviewRequestCreate(BaseModel):
     @field_validator("phone_e164")
     @classmethod
     def validate_phone(cls, v: str) -> str:
-        # Formato recomendado: +34XXXXXXXXX
         v = v.strip()
         if not v.startswith("+"):
             raise ValueError("El teléfono debe estar en formato E.164, por ejemplo +34699111222")
-        # No hacemos regex ultra estricta para no bloquear, pero validamos básico:
         digits = v[1:].replace(" ", "")
         if not digits.isdigit():
             raise ValueError("El teléfono E.164 solo debe contener dígitos tras el +")
@@ -34,7 +36,10 @@ class ReviewRequestOut(BaseModel):
     phone_e164: str
     appointment_at: datetime
     send_at: datetime
-    status: Literal["scheduled", "sent", "cancelled", "failed"]
+
+    # ✅ FIX: antes era Literal[...] y fallaba al recibir Enum
+    status: ReviewRequestStatus
+
     sent_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
     error_message: Optional[str] = None
