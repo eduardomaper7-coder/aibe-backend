@@ -7,11 +7,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.sql import func
 
-# Importa tu Base (ajusta según tu proyecto)
-# Opción A: si tienes Base en models.py o db.py:
-from db import Base  # <-- si tu Base está en db.py
-# Si tu Base está en models.py raíz, cambia a:
-# from models import Base
+from app.db import Base
+
 
 
 class ReviewRequestStatus(str, enum.Enum):
