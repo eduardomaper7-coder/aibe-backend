@@ -93,12 +93,22 @@ def root():
 # =========================
 @app.on_event("startup")
 def startup_event():
-    # ✅ IMPORTAR MODELOS AQUÍ (para registrar tablas)
-    from app import models as _models  # ScrapeJob, Review, etc.
-    from app.review_requests import models as _rr_models  # ReviewRequest, BusinessSettings
+    from app import models as _models
+    from app.review_requests import models as _rr_models
 
+    # DB
     Base.metadata.create_all(bind=engine)
     print("✅ DB ready:", engine.url)
+
+    # OpenAI
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        print("❌ OPENAI_API_KEY missing")
+        app.state.openai_client = None
+    else:
+        app.state.openai_client = OpenAI(api_key=api_key)
+        print("✅ OpenAI client ready")
 
 import re
 
@@ -109,6 +119,7 @@ import re
 
 app.include_router(gbp_router)
 app.include_router(google_oauth_router)
+app.include_router(nextauth_link_router)
 
 from app.review_requests.router import router as review_requests_router
 app.include_router(review_requests_router)
