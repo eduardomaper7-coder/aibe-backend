@@ -31,6 +31,8 @@ from pydantic import BaseModel, HttpUrl
 from sqlalchemy.orm import Session
 from api.google_oauth import router as google_oauth_router
 
+from api.nextauth_link import router as nextauth_link_router
+
 
 
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
