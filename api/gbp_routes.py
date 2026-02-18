@@ -7,6 +7,7 @@ import os
 import hashlib
 from datetime import datetime, timezone
 from fastapi import Request
+from fastapi import APIRouter, HTTPException, Depends, Security, Query, Request
 
 from app.db import get_db
 from app.models import ScrapeJob, Review, GoogleOAuth
@@ -17,6 +18,18 @@ router = APIRouter(prefix="/gbp", tags=["gbp"])
 # Antes: auto_error=True => si no hay Authorization, FastAPI devuelve 401 y rompe el frontend
 # Ahora: auto_error=False => nos deja decidir si usamos email+refresh_token o Bearer
 bearer_scheme = HTTPBearer(auto_error=False)
+def get_access_token_optional(
+    request: Request,
+    creds: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> str | None:
+    auth = request.headers.get("authorization")
+    print("🟡 AUTH HEADER RAW:", auth)
+
+    if not creds or not creds.credentials:
+        return None
+
+    print("🟡 TOKEN LEN:", len(creds.credentials))
+    return creds.credentials.strip()
 
 GOOGLE_ACCOUNTS_URL = "https://mybusinessaccountmanagement.googleapis.com/v1/accounts"
 GOOGLE_LOCATIONS_URL = "https://mybusinessbusinessinformation.googleapis.com/v1/{account}/locations"
