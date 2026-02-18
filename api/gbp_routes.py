@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Security
+from fastapi import APIRouter, HTTPException, Depends, Security, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import requests
 from sqlalchemy.orm import Session
@@ -12,27 +12,30 @@ from app.models import ScrapeJob, Review, GoogleOAuth
 
 router = APIRouter(prefix="/gbp", tags=["gbp"])
 
-bearer_scheme = HTTPBearer(auto_error=True)
+# ✅ CAMBIO CLAVE:
+# Antes: auto_error=True => si no hay Authorization, FastAPI devuelve 401 y rompe el frontend
+# Ahora: auto_error=False => nos deja decidir si usamos email+refresh_token o Bearer
+bearer_scheme = HTTPBearer(auto_error=False)
 
 GOOGLE_ACCOUNTS_URL = "https://mybusinessaccountmanagement.googleapis.com/v1/accounts"
 GOOGLE_LOCATIONS_URL = "https://mybusinessbusinessinformation.googleapis.com/v1/{account}/locations"
-
-# Reviews list (GBP v4)
 GOOGLE_REVIEWS_LIST_URL = "https://mybusiness.googleapis.com/v4/{parent}/reviews"
-
-# Userinfo (OpenID)
 GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
-
-# Token refresh
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
-def get_access_token(creds: HTTPAuthorizationCredentials = Security(bearer_scheme)) -> str:
+def get_access_token_optional(
+    creds: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
+) -> str | None:
+    """
+    Devuelve Bearer token si viene, o None si no viene.
+    """
+    if not creds or not creds.credentials:
+        return None
     return creds.credentials.strip()
 
 
 def google_get(url: str, access_token: str, params=None) -> dict:
-    """GET a Google API endpoint with debug logs + safe JSON parsing."""
     r = requests.get(
         url,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -40,7 +43,6 @@ def google_get(url: str, access_token: str, params=None) -> dict:
         timeout=30,
     )
 
-    # ✅ DEBUG para confirmar que realmente llamas a Google y qué responde
     print("🟣 GOOGLE GET:", r.status_code, url, "params=", params)
     print("🟣 GOOGLE RAW TEXT (first 500):", (r.text or "")[:500])
 
@@ -54,12 +56,10 @@ def google_get(url: str, access_token: str, params=None) -> dict:
     try:
         return r.json()
     except Exception:
-        # Si Google devuelve algo no-JSON, lo verás en el RAW TEXT
         return {}
 
 
 def google_get_userinfo(access_token: str) -> dict:
-    """Fetch OpenID userinfo to obtain the email."""
     r = requests.get(
         GOOGLE_USERINFO_URL,
         headers={"Authorization": f"Bearer {access_token}"},
@@ -72,263 +72,6 @@ def google_get_userinfo(access_token: str) -> dict:
             detail = r.text
         raise HTTPException(status_code=r.status_code, detail=detail)
     return r.json()
-
-
-def star_to_int(star: str | None) -> int:
-    m = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}
-    return m.get((star or "").upper(), 0)
-
-
-def pick_best_location(locations_out: list[dict]) -> dict | None:
-    return locations_out[0] if locations_out else None
-
-
-def location_to_job_url(location_name: str) -> str:
-    return f"gbp://{location_name}"
-
-
-def location_to_place_key(location_name: str) -> str:
-    return f"gbp::{location_name}".lower()
-
-
-@router.get("/locations")
-def list_locations(
-    db: Session = Depends(get_db),  # (no lo usamos aquí, pero lo dejo por consistencia)
-    access_token: str = Depends(get_access_token),
-):
-    accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
-
-    locations_out = []
-    for acc in accounts:
-        acc_name = acc.get("name")  # "accounts/123"
-        if not acc_name:
-            continue
-
-        locs = google_get(
-            GOOGLE_LOCATIONS_URL.format(account=acc_name),
-            access_token,
-            params={"readMask": "name,title,storefrontAddress"},
-        ).get("locations", []) or []
-
-        for loc in locs:
-            title = loc.get("title") or "Tu negocio"
-            addr = ""
-
-            sa = loc.get("storefrontAddress")
-            if sa:
-                address_lines = sa.get("addressLines") or []
-                line1 = address_lines[0] if address_lines else ""
-                addr = " ".join(
-                    [line1, sa.get("locality", "") or "", sa.get("postalCode", "") or ""]
-                ).strip()
-
-            loc_name = loc.get("name")  # normalmente "locations/456"
-            if not loc_name:
-                continue
-
-            # ✅ devolver siempre accounts/.../locations/...
-            full_location_name = (
-                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
-            )
-
-            locations_out.append(
-                {"name": full_location_name, "title": title, "address": addr}
-            )
-
-    return {"locations": locations_out}
-
-
-@router.post("/auto-job")
-def auto_job(
-    db: Session = Depends(get_db),
-    access_token: str = Depends(get_access_token),
-):
-    """
-    Crea un job automáticamente (elige el primer negocio) y descarga reseñas.
-    - Obtiene el email vía userinfo (OpenID)
-    - Guarda email en place_key para poder reusar con /gbp/last-job
-    """
-
-    # 0) userinfo -> email
-    ui = google_get_userinfo(access_token)
-    email = (ui.get("email") or "").strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="No se pudo obtener email del usuario (userinfo)")
-
-    # 1) listar accounts
-    accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
-    if not accounts:
-        raise HTTPException(status_code=404, detail="No se encontraron cuentas GBP")
-
-    # 2) listar locations
-    locations_out = []
-    for acc in accounts:
-        acc_name = acc.get("name")
-        if not acc_name:
-            continue
-
-        locs = google_get(
-            GOOGLE_LOCATIONS_URL.format(account=acc_name),
-            access_token,
-            params={"readMask": "name,title,storefrontAddress"},
-        ).get("locations", []) or []
-
-        for loc in locs:
-            title = loc.get("title") or "Tu negocio"
-            loc_name = loc.get("name")
-            if not loc_name:
-                continue
-
-            full_location_name = (
-                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
-            )
-            locations_out.append({"name": full_location_name, "title": title})
-
-    chosen = pick_best_location(locations_out)
-    if not chosen:
-        raise HTTPException(status_code=404, detail="No se encontraron negocios en esta cuenta")
-
-    location_name = chosen["name"]  # accounts/.../locations/...
-    place_title = chosen["title"]
-
-    # 3) crear job
-    job = ScrapeJob(
-        google_maps_url=location_to_job_url(location_name),
-        place_key=f"user::{email}::{location_to_place_key(location_name)}",
-        place_name=place_title,
-        actor_id="gbp",
-        status="running",
-        apify_run_id=None,
-        error=None,
-    )
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-
-    # 4) bajar reseñas
-    saved = 0
-    page_token = None
-
-    while True:
-        params = {"pageSize": 50, "orderBy": "updateTime desc"}
-        if page_token:
-            params["pageToken"] = page_token
-
-        data = google_get(
-            GOOGLE_REVIEWS_LIST_URL.format(parent=location_name),
-            access_token,
-            params=params,
-        )
-
-        # 🔎 DEBUG DURO – confirma respuesta real de Google
-        print("🔵 GOOGLE REVIEWS RESPONSE KEYS:", list(data.keys()))
-        print("🔵 GOOGLE REVIEWS COUNT:", len(data.get("reviews", []) or []))
-        print("🔵 GOOGLE NEXT PAGE TOKEN:", data.get("nextPageToken"))
-
-        reviews = data.get("reviews", []) or []
-
-        print(
-            "📦 Google reviews:",
-            {
-                "count": len(reviews),
-                "has_next": bool(data.get("nextPageToken")),
-                "location": location_name,
-            },
-        )
-
-        for r in reviews:
-            rating = star_to_int(r.get("starRating"))
-            text = (r.get("comment") or "").strip()
-            published_at = r.get("createTime") or r.get("updateTime")
-            author = ((r.get("reviewer") or {}).get("displayName")) or None
-            review_url = r.get("reviewUrl")
-
-            # ✅ FIX: raw es NOT NULL en tu modelo
-            db.add(
-                Review(
-                    job_id=job.id,
-                    rating=rating,
-                    text=text,
-                    published_at=published_at,
-                    author_name=author,
-                    review_url=review_url,
-                    raw=r,  # ✅ obligatorio
-                )
-            )
-            saved += 1
-
-        # commit por página
-        if reviews:
-            try:
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                print("❌ DB commit error saving reviews:", repr(e))
-                raise
-
-        page_token = data.get("nextPageToken")
-        if not page_token:
-            break
-
-    job.status = "done"
-    db.add(job)
-    db.commit()
-
-    print("✅ TOTAL SAVED:", saved)
-
-    return {
-        "job_id": job.id,
-        "status": job.status,
-        "reviews_saved": saved,
-        "location_name": location_name,
-        "place_name": place_title,
-        "email": email,
-    }
-
-
-@router.get("/last-job")
-def last_job(
-    db: Session = Depends(get_db),
-    access_token: str = Depends(get_access_token),
-):
-    """
-    Devuelve el último job creado por este usuario (por email),
-    o {job_id: null} si no hay.
-    """
-    ui = google_get_userinfo(access_token)
-    email = (ui.get("email") or "").strip().lower()
-    if not email:
-        return {"job_id": None}
-
-    key_prefix = f"user::{email}::"
-
-    job = (
-        db.query(ScrapeJob)
-        .filter(ScrapeJob.place_key.like(key_prefix + "%"))
-        .order_by(ScrapeJob.id.desc())
-        .first()
-    )
-
-    return {"job_id": job.id if job else None}
-
-
-@router.get("/job-stats/{job_id}")
-def job_stats(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job no encontrado")
-
-    total_reviews = (
-        db.query(func.count(Review.id)).filter(Review.job_id == job_id).scalar() or 0
-    )
-
-    return {
-        "job_id": job.id,
-        "status": job.status,
-        "place_name": job.place_name,
-        "location_name": getattr(job, "google_maps_url", None),
-        "reviews_saved": total_reviews,
-    }
 
 
 def refresh_access_token(refresh_token: str) -> str:
@@ -359,6 +102,272 @@ def refresh_access_token(refresh_token: str) -> str:
 
     return data["access_token"]
 
+
+def resolve_access_token(db: Session, bearer_token: str | None, email: str | None) -> tuple[str, str]:
+    """
+    ✅ Devuelve (access_token, email_resuelto)
+    - Si viene Bearer: usamos userinfo para sacar el email
+    - Si NO viene Bearer: usamos ?email= y refresh_token guardado en DB
+    """
+    # 1) Si viene Bearer, úsalo
+    if bearer_token:
+        ui = google_get_userinfo(bearer_token)
+        em = (ui.get("email") or "").strip().lower()
+        if not em:
+            raise HTTPException(status_code=401, detail="Bearer token válido pero no se pudo obtener email (userinfo)")
+        return bearer_token, em
+
+    # 2) Si no viene Bearer, necesitamos email para usar refresh_token
+    em = (email or "").strip().lower()
+    if not em:
+        raise HTTPException(
+            status_code=401,
+            detail="Falta Authorization Bearer o email. Usa /gbp/last-job?email=... (o envía Bearer).",
+        )
+
+    oauth = (
+        db.query(GoogleOAuth)
+        .filter(GoogleOAuth.email == em, GoogleOAuth.connected == True)
+        .first()
+    )
+    if not oauth or not oauth.refresh_token:
+        raise HTTPException(status_code=401, detail="Este email no tiene Google conectado (no hay refresh_token)")
+
+    access_token = refresh_access_token(oauth.refresh_token)
+    return access_token, em
+
+
+def star_to_int(star: str | None) -> int:
+    m = {"ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5}
+    return m.get((star or "").upper(), 0)
+
+
+def pick_best_location(locations_out: list[dict]) -> dict | None:
+    return locations_out[0] if locations_out else None
+
+
+def location_to_job_url(location_name: str) -> str:
+    return f"gbp://{location_name}"
+
+
+def location_to_place_key(location_name: str) -> str:
+    return f"gbp::{location_name}".lower()
+
+
+@router.get("/locations")
+def list_locations(
+    email: str | None = Query(None),
+    db: Session = Depends(get_db),
+    bearer_token: str | None = Depends(get_access_token_optional),
+):
+    access_token, _ = resolve_access_token(db=db, bearer_token=bearer_token, email=email)
+
+    accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
+
+    locations_out = []
+    for acc in accounts:
+        acc_name = acc.get("name")
+        if not acc_name:
+            continue
+
+        locs = google_get(
+            GOOGLE_LOCATIONS_URL.format(account=acc_name),
+            access_token,
+            params={"readMask": "name,title,storefrontAddress"},
+        ).get("locations", []) or []
+
+        for loc in locs:
+            title = loc.get("title") or "Tu negocio"
+            addr = ""
+
+            sa = loc.get("storefrontAddress")
+            if sa:
+                address_lines = sa.get("addressLines") or []
+                line1 = address_lines[0] if address_lines else ""
+                addr = " ".join(
+                    [line1, sa.get("locality", "") or "", sa.get("postalCode", "") or ""]
+                ).strip()
+
+            loc_name = loc.get("name")
+            if not loc_name:
+                continue
+
+            full_location_name = (
+                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
+            )
+
+            locations_out.append({"name": full_location_name, "title": title, "address": addr})
+
+    return {"locations": locations_out}
+
+
+@router.post("/auto-job")
+def auto_job(
+    email: str | None = Query(None),
+    db: Session = Depends(get_db),
+    bearer_token: str | None = Depends(get_access_token_optional),
+):
+    """
+    ✅ YA NO ROMPE EL FRONTEND:
+    - Si viene Bearer: ok
+    - Si NO viene Bearer: usa ?email= + refresh_token guardado en DB
+    """
+    access_token, email_resolved = resolve_access_token(db=db, bearer_token=bearer_token, email=email)
+
+    accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
+    if not accounts:
+        raise HTTPException(status_code=404, detail="No se encontraron cuentas GBP")
+
+    locations_out = []
+    for acc in accounts:
+        acc_name = acc.get("name")
+        if not acc_name:
+            continue
+
+        locs = google_get(
+            GOOGLE_LOCATIONS_URL.format(account=acc_name),
+            access_token,
+            params={"readMask": "name,title,storefrontAddress"},
+        ).get("locations", []) or []
+
+        for loc in locs:
+            title = loc.get("title") or "Tu negocio"
+            loc_name = loc.get("name")
+            if not loc_name:
+                continue
+
+            full_location_name = (
+                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
+            )
+            locations_out.append({"name": full_location_name, "title": title})
+
+    chosen = pick_best_location(locations_out)
+    if not chosen:
+        raise HTTPException(status_code=404, detail="No se encontraron negocios en esta cuenta")
+
+    location_name = chosen["name"]
+    place_title = chosen["title"]
+
+    job = ScrapeJob(
+        google_maps_url=location_to_job_url(location_name),
+        place_key=f"user::{email_resolved}::{location_to_place_key(location_name)}",
+        place_name=place_title,
+        actor_id="gbp",
+        status="running",
+        apify_run_id=None,
+        error=None,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    saved = 0
+    page_token = None
+
+    while True:
+        params = {"pageSize": 50, "orderBy": "updateTime desc"}
+        if page_token:
+            params["pageToken"] = page_token
+
+        data = google_get(
+            GOOGLE_REVIEWS_LIST_URL.format(parent=location_name),
+            access_token,
+            params=params,
+        )
+
+        reviews = data.get("reviews", []) or []
+
+        for r in reviews:
+            rating = star_to_int(r.get("starRating"))
+            text = (r.get("comment") or "").strip()
+            published_at = r.get("createTime") or r.get("updateTime")
+            author = ((r.get("reviewer") or {}).get("displayName")) or None
+            review_url = r.get("reviewUrl")
+
+            db.add(
+                Review(
+                    job_id=job.id,
+                    rating=rating,
+                    text=text,
+                    published_at=published_at,
+                    author_name=author,
+                    review_url=review_url,
+                    raw=r,
+                )
+            )
+            saved += 1
+
+        if reviews:
+            try:
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print("❌ DB commit error saving reviews:", repr(e))
+                raise
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    job.status = "done"
+    db.add(job)
+    db.commit()
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "reviews_saved": saved,
+        "location_name": location_name,
+        "place_name": place_title,
+        "email": email_resolved,
+    }
+
+
+@router.get("/last-job")
+def last_job(
+    email: str | None = Query(None),
+    db: Session = Depends(get_db),
+    bearer_token: str | None = Depends(get_access_token_optional),
+):
+    """
+    ✅ YA NO ROMPE EL FRONTEND:
+    - Si viene Bearer: ok
+    - Si NO viene Bearer: usa ?email= + refresh_token guardado en DB
+    """
+    access_token, email_resolved = resolve_access_token(db=db, bearer_token=bearer_token, email=email)
+
+    key_prefix = f"user::{email_resolved}::"
+
+    job = (
+        db.query(ScrapeJob)
+        .filter(ScrapeJob.place_key.like(key_prefix + "%"))
+        .order_by(ScrapeJob.id.desc())
+        .first()
+    )
+
+    return {"job_id": job.id if job else None}
+
+
+@router.get("/job-stats/{job_id}")
+def job_stats(job_id: int, db: Session = Depends(get_db)):
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job no encontrado")
+
+    total_reviews = (
+        db.query(func.count(Review.id)).filter(Review.job_id == job_id).scalar() or 0
+    )
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "place_name": job.place_name,
+        "location_name": getattr(job, "google_maps_url", None),
+        "reviews_saved": total_reviews,
+    }
+
+
+# ---- lo demás lo dejas igual (sync, helpers, etc.) ----
 
 def extract_location_name_from_job(job: ScrapeJob) -> str | None:
     v = (job.google_maps_url or "").strip()
@@ -395,7 +404,6 @@ def ensure_job_for_email(db: Session, email: str, access_token: str) -> ScrapeJo
     if job:
         return job
 
-    # No hay job -> creamos uno “auto” (igual que auto_job)
     accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
     if not accounts:
         raise HTTPException(status_code=404, detail="No se encontraron cuentas GBP")
@@ -450,10 +458,6 @@ def sync_gbp_reviews(
     email: str,
     db: Session = Depends(get_db),
 ):
-    """
-    Sincroniza reseñas usando refresh_token guardado en Postgres.
-    Uso: POST /gbp/sync?email=usuario@dominio.com
-    """
     email = (email or "").strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="email requerido")
@@ -479,7 +483,6 @@ def sync_gbp_reviews(
     db.commit()
     db.refresh(job)
 
-    # Dedupe desde raws existentes
     existing_rows = (
         db.query(Review.raw)
         .filter(Review.job_id == job.id)
