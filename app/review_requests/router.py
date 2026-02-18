@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+
 from .sender import process_pending
 from app.db import get_db
 
@@ -20,13 +21,8 @@ from . import repo
 router = APIRouter(prefix="/api", tags=["review-requests"])
 
 
-
-
-
-
 @router.post("/review-requests", response_model=ReviewRequestOut)
 def create_review_request(payload: ReviewRequestCreate, db: Session = Depends(get_db)):
-    # ✅ 60 minutos después de la cita (compute_send_at ya debe sumar 60 min)
     send_at = compute_send_at(payload.appointment_at)
 
     rr = repo.create_review_request(
@@ -60,20 +56,15 @@ def cancel_request(request_id: int, db: Session = Depends(get_db)):
 
 @router.get("/business-settings", response_model=BusinessSettingsOut)
 def get_settings(job_id: int = Query(...), db: Session = Depends(get_db)):
-    # ✅ Carga settings y, si falta, intenta autogenerar google_review_url desde place_id del job
     bs = repo.get_business_settings(db, job_id=job_id)
 
-    if bs:
-        try:
-            repo.ensure_review_url(db, job_id=job_id)
-        except Exception:
-            # no rompemos el panel si no se puede autogenerar
-            pass
-        bs = repo.get_business_settings(db, job_id=job_id)
-
     if not bs:
-        # devolvemos vacío en vez de 404 para que el front lo trate fácil
-        return {"job_id": job_id, "google_review_url": None, "business_name": None}
+        return {
+            "job_id": job_id,
+            "google_place_id": None,
+            "google_review_url": None,
+            "business_name": None,
+        }
 
     return bs
 
@@ -83,28 +74,23 @@ def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_d
     bs = repo.upsert_business_settings(
         db,
         job_id=payload.job_id,
-        google_place_id=payload.google_place_id,   # ✅ AÑADIR ESTA LÍNEA
+        google_place_id=payload.google_place_id,  # ✅ ok
         google_review_url=payload.google_review_url,
         business_name=payload.business_name,
     )
 
-    # ✅ tras upsert, intentamos completar google_review_url si sigue vacío
-    try:
-        repo.ensure_review_url(db, job_id=payload.job_id)
-    except Exception:
-        pass
-
-    bs = repo.get_business_settings(db, job_id=payload.job_id)
     if not bs:
         raise HTTPException(status_code=500, detail="No se pudo guardar configuración")
-    return bs
 
+    return bs
 
 
 @router.get("/review-requests/stats")
 def stats(job_id: int = Query(...), db: Session = Depends(get_db)):
     return repo.get_stats(db, job_id=job_id)
 
+
 @router.post("/review-requests/send-due")
 def send_due(db: Session = Depends(get_db)):
+    # ✅ aquí es donde se resuelve placeId/url y se envía (vía sender.process_pending)
     return process_pending(db)

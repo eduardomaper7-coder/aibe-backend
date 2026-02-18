@@ -57,22 +57,21 @@ class CancelOut(BaseModel):
     status: str
 
 
-class BusinessSettingsUpsert(BaseModel):
-    job_id: int
-    google_review_url: Optional[str] = None
-    business_name: Optional[str] = None
 
 
 class BusinessSettingsOut(BaseModel):
     job_id: int
+    google_place_id: Optional[str] = None
     google_review_url: Optional[str] = None
     business_name: Optional[str] = None
 
     class Config:
         from_attributes = True
 
+
 class BusinessSettingsUpsert(BaseModel):
     job_id: int
     google_place_id: Optional[str] = None
     google_review_url: Optional[str] = None
     business_name: Optional[str] = None
+

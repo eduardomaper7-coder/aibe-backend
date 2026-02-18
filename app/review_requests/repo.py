@@ -88,26 +88,7 @@ def mark_failed(db: Session, *, rr: ReviewRequest, error_message: str) -> None:
     db.commit()
 
 
-def upsert_business_settings(
-    db: Session,
-    *,
-    job_id: int,
-    google_review_url: Optional[str],
-    business_name: Optional[str],
-) -> BusinessSettings:
-    bs = db.get(BusinessSettings, job_id)
-    if not bs:
-        bs = BusinessSettings(job_id=job_id)
-        db.add(bs)
 
-    if google_review_url is not None:
-        bs.google_review_url = google_review_url.strip() if google_review_url else None
-    if business_name is not None:
-        bs.business_name = business_name.strip() if business_name else None
-
-    db.commit()
-    db.refresh(bs)
-    return bs
 
 
 def get_business_settings(db: Session, *, job_id: int) -> Optional[BusinessSettings]:
@@ -218,3 +199,113 @@ def upsert_business_settings(
     db.commit()
     db.refresh(bs)
     return bs
+
+
+import os
+import requests
+
+def build_review_url_from_place_id(place_id: str) -> str:
+    place_id = (place_id or "").strip()
+    return f"https://search.google.com/local/writereview?placeid={place_id}"
+
+
+def resolve_place_id_via_places_api(query: str) -> str | None:
+    """
+    Usa Google Places 'Find Place From Text' para obtener place_id desde texto.
+    Requiere GOOGLE_MAPS_API_KEY en env.
+    """
+    key = (os.getenv("GOOGLE_MAPS_API_KEY") or "").strip()
+    if not key:
+        return None
+
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    r = requests.get(
+        "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
+        params={
+            "input": q,
+            "inputtype": "textquery",
+            "fields": "place_id",
+            "key": key,
+            "language": "es",
+        },
+        timeout=15,
+    )
+    data = r.json() if r.content else {}
+    if data.get("status") != "OK":
+        return None
+
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return None
+
+    return candidates[0].get("place_id") or None
+
+
+def ensure_business_review_url(db: Session, *, job_id: int) -> str:
+    """
+    Devuelve una URL de reseñas lista para usar.
+
+    Prioridad:
+    1) Si ya existe google_review_url => la devuelve
+    2) Si hay google_place_id => genera url, la guarda y devuelve
+    3) Si no hay place_id => lo resuelve vía Google Places API usando:
+       - ScrapeJob.place_name
+       - o BusinessSettings.business_name (fallback)
+
+    Guarda place_id + url en DB.
+    Lanza RuntimeError si no puede resolver.
+    """
+
+    # 1) Cargar o crear BusinessSettings
+    bs = db.get(BusinessSettings, job_id)
+
+    if not bs:
+        bs = BusinessSettings(job_id=job_id)
+        db.add(bs)
+        db.commit()
+        db.refresh(bs)
+
+    # 2) Si ya hay URL guardada
+    url = (bs.google_review_url or "").strip()
+    if url:
+        return url
+
+    # 3) Si ya hay place_id guardado
+    place_id = (bs.google_place_id or "").strip()
+    if place_id:
+        url = build_review_url_from_place_id(place_id)
+        bs.google_review_url = url
+        db.commit()
+        return url
+
+    # 4) Intentar obtener nombre del negocio (job → fallback business_name)
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+
+    name = (getattr(job, "place_name", None) or "").strip() if job else ""
+
+    if not name:
+        name = (bs.business_name or "").strip()
+
+    if not name:
+        raise RuntimeError(
+            "No puedo resolver place_id: falta ScrapeJob.place_name y business_settings.business_name"
+        )
+
+    # 5) Resolver place_id vía Google Places API
+    resolved = resolve_place_id_via_places_api(name)
+
+    if not resolved:
+        raise RuntimeError(
+            f"No pude obtener place_id desde Places API (query='{name}')"
+        )
+
+    # 6) Guardar en DB
+    bs.google_place_id = resolved
+    bs.google_review_url = build_review_url_from_place_id(resolved)
+
+    db.commit()
+
+    return bs.google_review_url
