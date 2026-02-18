@@ -80,10 +80,10 @@ def get_settings(job_id: int = Query(...), db: Session = Depends(get_db)):
 
 @router.patch("/business-settings", response_model=BusinessSettingsOut)
 def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_db)):
-    # ✅ El front puede mandar solo business_name (google_review_url lo gestionamos nosotros)
     bs = repo.upsert_business_settings(
         db,
         job_id=payload.job_id,
+        google_place_id=payload.google_place_id,   # ✅ AÑADIR ESTA LÍNEA
         google_review_url=payload.google_review_url,
         business_name=payload.business_name,
     )
@@ -98,6 +98,7 @@ def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_d
     if not bs:
         raise HTTPException(status_code=500, detail="No se pudo guardar configuración")
     return bs
+
 
 
 @router.get("/review-requests/stats")

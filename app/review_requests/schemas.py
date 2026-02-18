@@ -70,3 +70,9 @@ class BusinessSettingsOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+class BusinessSettingsUpsert(BaseModel):
+    job_id: int
+    google_place_id: Optional[str] = None
+    google_review_url: Optional[str] = None
+    business_name: Optional[str] = None

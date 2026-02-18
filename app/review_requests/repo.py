@@ -154,18 +154,67 @@ def ensure_review_url(db: Session, *, job_id: int) -> None:
     bs = db.get(BusinessSettings, job_id)
     if not bs:
         return
-    if bs.google_review_url:
+
+    # Si ya existe URL, no hacemos nada
+    if (bs.google_review_url or "").strip():
         return
 
+    # 1) PRIORIDAD: generar desde google_place_id
+    place_id = (bs.google_place_id or "").strip()
+    if place_id:
+        bs.google_review_url = f"https://search.google.com/local/writereview?placeid={place_id}"
+        db.commit()
+        return
+
+    # 2) Fallback: intentar sacarlo del job (legacy / casos antiguos)
     job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
     if not job:
         return
 
-    url = getattr(job, "google_maps_url", None) or ""
-    m = PLACE_ID_RE.search(url)
+    url = (getattr(job, "google_maps_url", None) or "").strip()
+
+    # Buscar placeid en URLs típicas
+    m = re.search(r"[?&]placeid=([A-Za-z0-9_-]+)", url)
+    if not m:
+        m = re.search(r"place_id:([A-Za-z0-9_-]+)", url)
+
     if not m:
         return
 
     place_id = m.group(1)
+
+    bs.google_place_id = place_id
     bs.google_review_url = f"https://search.google.com/local/writereview?placeid={place_id}"
+
     db.commit()
+
+
+
+def upsert_business_settings(
+    db: Session,
+    *,
+    job_id: int,
+    google_place_id: Optional[str] = None,
+    google_review_url: Optional[str] = None,
+    business_name: Optional[str] = None,
+) -> BusinessSettings:
+    bs = db.get(BusinessSettings, job_id)
+    if not bs:
+        bs = BusinessSettings(job_id=job_id)
+        db.add(bs)
+
+    if google_place_id is not None:
+        bs.google_place_id = google_place_id.strip() if google_place_id else None
+        # si llega place_id y no llega url, la generamos
+        if bs.google_place_id and not (bs.google_review_url or "").strip():
+            bs.google_review_url = f"https://search.google.com/local/writereview?placeid={bs.google_place_id}"
+
+    if google_review_url is not None:
+        bs.google_review_url = google_review_url.strip() if google_review_url else None
+
+    if business_name is not None:
+        bs.business_name = business_name.strip() if business_name else None
+
+    db.commit()
+    db.refresh(bs)
+    return bs
