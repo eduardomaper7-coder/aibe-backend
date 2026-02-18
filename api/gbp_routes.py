@@ -121,26 +121,21 @@ def refresh_access_token(refresh_token: str) -> str:
 
 
 def resolve_access_token(db: Session, bearer_token: str | None, email: str | None) -> tuple[str, str]:
-    """
-    ✅ Devuelve (access_token, email_resuelto)
-    - Si viene Bearer: usamos userinfo para sacar el email
-    - Si NO viene Bearer: usamos ?email= y refresh_token guardado en DB
-    """
-    # 1) Si viene Bearer, úsalo
+    # 1) Si viene Bearer, INTENTA userinfo
     if bearer_token:
-        ui = google_get_userinfo(bearer_token)
-        em = (ui.get("email") or "").strip().lower()
-        if not em:
-            raise HTTPException(status_code=401, detail="Bearer token válido pero no se pudo obtener email (userinfo)")
-        return bearer_token, em
+        try:
+            ui = google_get_userinfo(bearer_token)
+            em = (ui.get("email") or "").strip().lower()
+            if em:
+                return bearer_token, em
+        except HTTPException as e:
+            # 👇 fallback a email+refresh_token
+            print("⚠️ userinfo failed, fallback to email+refresh:", getattr(e, "detail", None))
 
-    # 2) Si no viene Bearer, necesitamos email para usar refresh_token
+    # 2) Fallback: email + refresh_token en DB
     em = (email or "").strip().lower()
     if not em:
-        raise HTTPException(
-            status_code=401,
-            detail="Falta Authorization Bearer o email. Usa /gbp/last-job?email=... (o envía Bearer).",
-        )
+        raise HTTPException(status_code=401, detail="Falta email para fallback (usa ?email=...)")
 
     oauth = (
         db.query(GoogleOAuth)
@@ -152,6 +147,7 @@ def resolve_access_token(db: Session, bearer_token: str | None, email: str | Non
 
     access_token = refresh_access_token(oauth.refresh_token)
     return access_token, em
+
 
 
 def star_to_int(star: str | None) -> int:
