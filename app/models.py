@@ -70,6 +70,9 @@ class GoogleOAuth(Base):
 
     google_user_id: Mapped[str | None] = mapped_column(String, nullable=True)
 
+    # ✅ NUEVO: para recordar la account correcta (accounts/xxxxx)
+    google_account_id: Mapped[str | None] = mapped_column(String, nullable=True)
+
     scope: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     connected: Mapped[bool] = mapped_column(Boolean, default=True)
