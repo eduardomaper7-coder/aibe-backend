@@ -13,29 +13,6 @@ POLL_SECONDS = int(os.environ.get("REVIEW_SENDER_POLL_SECONDS", "30"))
 BATCH_SIZE = int(os.environ.get("REVIEW_SENDER_BATCH_SIZE", "25"))
 
 
-def build_review_url(bs) -> str:
-    """
-    Devuelve una URL válida para reseña.
-    Prioridad:
-    1) business_settings.google_review_url (si existe)
-    2) generar desde business_settings.google_place_id
-    """
-    if not bs:
-        return ""
-
-    # 1) URL guardada
-    url = (getattr(bs, "google_review_url", None) or "").strip()
-    if url:
-        return url
-
-    # 2) generar desde place_id
-    place_id = (getattr(bs, "google_place_id", None) or "").strip()
-    if place_id:
-        return f"https://search.google.com/local/writereview?placeid={place_id}"
-
-    return ""
-
-
 def main():
     Base.metadata.create_all(bind=engine)
 
@@ -66,14 +43,8 @@ def main():
 
             for rr in due:
                 try:
-                    bs = repo.get_business_settings(db, job_id=rr.job_id)
-
-                    review_url = build_review_url(bs)
-                    if not review_url:
-                        raise RuntimeError(
-                            "No hay google_review_url ni google_place_id en business_settings "
-                            f"(job_id={rr.job_id}). No puedo enviar template ({{2}} requerido)."
-                        )
+                    # ✅ CLAVE: garantiza URL (crea business_settings + place_id + url si falta)
+                    review_url = repo.ensure_business_review_url(db, job_id=rr.job_id)
 
                     name = (rr.customer_name or "").strip() or "😊"
 
@@ -82,9 +53,10 @@ def main():
                         "2": review_url,
                     }
 
-                    # DEBUG útil (puedes quitarlo luego)
-                    print("[review_sender] sending to", rr.phone_e164,
-                          "content_variables=", json.dumps(variables, ensure_ascii=False))
+                    print(
+                        "[review_sender] sending to", rr.phone_e164,
+                        "content_variables=", json.dumps(variables, ensure_ascii=False),
+                    )
 
                     sid = send_whatsapp_template(
                         to_e164=rr.phone_e164,
