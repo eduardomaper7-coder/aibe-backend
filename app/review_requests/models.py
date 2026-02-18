@@ -10,7 +10,6 @@ from sqlalchemy.sql import func
 from app.db import Base
 
 
-
 class ReviewRequestStatus(str, enum.Enum):
     scheduled = "scheduled"
     sent = "sent"
@@ -50,7 +49,11 @@ class BusinessSettings(Base):
 
     job_id = Column(Integer, primary_key=True)
 
-    # Ejemplo: https://g.page/r/XXXX/review
+    # ✅ NUEVO: Place ID para generar la URL automáticamente
+    # Ejemplo: ChIJrYaFfMAgQg0RwUizaSyFE80
+    google_place_id = Column(String(128), nullable=True)
+
+    # Ejemplo: https://search.google.com/local/writereview?placeid=XXXX
     google_review_url = Column(Text, nullable=True)
 
     business_name = Column(String(200), nullable=True)

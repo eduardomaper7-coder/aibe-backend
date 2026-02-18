@@ -33,6 +33,8 @@ from api.google_oauth import router as google_oauth_router
 
 from api.nextauth_link import router as nextauth_link_router
 
+from app.review_requests.settings_router import router as settings_router
+app.include_router(settings_router)
 
 
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
