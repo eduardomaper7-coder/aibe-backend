@@ -1,4 +1,3 @@
-from fastapi import APIRouter, HTTPException, Depends, Security, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import requests
 from sqlalchemy.orm import Session
@@ -11,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Depends, Security, Query, Request
 
 from app.db import get_db
 from app.models import ScrapeJob, Review, GoogleOAuth
-
+from pydantic import BaseModel
 router = APIRouter(prefix="/gbp", tags=["gbp"])
 
 # ✅ CAMBIO CLAVE:
@@ -155,8 +154,16 @@ def star_to_int(star: str | None) -> int:
     return m.get((star or "").upper(), 0)
 
 
-def pick_best_location(locations_out: list[dict]) -> dict | None:
-    return locations_out[0] if locations_out else None
+def pick_best_location(locations_out: list[dict], preferred_account: str | None = None) -> dict | None:
+    if not locations_out:
+        return None
+    if preferred_account:
+        for loc in locations_out:
+            if loc.get("account") == preferred_account:
+                return loc
+    return locations_out[0]
+
+
 
 
 def location_to_job_url(location_name: str) -> str:
@@ -166,18 +173,16 @@ def location_to_job_url(location_name: str) -> str:
 def location_to_place_key(location_name: str) -> str:
     return f"gbp::{location_name}".lower()
 
-
-@router.get("/locations")
-def list_locations(
-    email: str | None = Query(None),
-    db: Session = Depends(get_db),
-    bearer_token: str | None = Depends(get_access_token_optional),
-):
-    access_token, _ = resolve_access_token(db=db, bearer_token=bearer_token, email=email)
-
+def discover_locations(access_token: str) -> list[dict]:
+    """
+    Devuelve lista de locations con su account asociado:
+    [
+      {"account": "accounts/..", "name": "accounts/../locations/..", "title": "...", "address": "..."}
+    ]
+    """
     accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
 
-    locations_out = []
+    out: list[dict] = []
     for acc in accounts:
         acc_name = acc.get("name")
         if not acc_name:
@@ -190,28 +195,56 @@ def list_locations(
         ).get("locations", []) or []
 
         for loc in locs:
-            title = loc.get("title") or "Tu negocio"
-            addr = ""
-
-            sa = loc.get("storefrontAddress")
-            if sa:
-                address_lines = sa.get("addressLines") or []
-                line1 = address_lines[0] if address_lines else ""
-                addr = " ".join(
-                    [line1, sa.get("locality", "") or "", sa.get("postalCode", "") or ""]
-                ).strip()
-
             loc_name = loc.get("name")
             if not loc_name:
                 continue
 
-            full_location_name = (
-                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
-            )
+            # Normaliza a "accounts/.../locations/..."
+            full_location_name = f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
 
-            locations_out.append({"name": full_location_name, "title": title, "address": addr})
+            title = loc.get("title") or "Tu negocio"
 
-    return {"locations": locations_out}
+            addr = ""
+            sa = loc.get("storefrontAddress") or {}
+            if sa:
+                address_lines = sa.get("addressLines") or []
+                line1 = address_lines[0] if address_lines else ""
+                addr = " ".join([line1, sa.get("locality", "") or "", sa.get("postalCode", "") or ""]).strip()
+
+            out.append({
+                "account": acc_name,
+                "name": full_location_name,
+                "title": title,
+                "address": addr,
+            })
+
+    return out
+
+@router.get("/locations")
+def list_locations(
+    email: str | None = Query(None),
+    db: Session = Depends(get_db),
+    bearer_token: str | None = Depends(get_access_token_optional),
+):
+    # Resolver token (Bearer o refresh)
+    access_token, _ = resolve_access_token(
+        db=db, bearer_token=bearer_token, email=email
+    )
+
+    # ✅ Reutiliza lógica centralizada
+    locations_out = discover_locations(access_token)
+
+    return {
+        "locations": [
+            {
+                "name": l["name"],
+                "title": l["title"],
+                "address": l.get("address", ""),
+            }
+            for l in locations_out
+        ]
+    }
+
 
 
 @router.post("/auto-job")
@@ -224,41 +257,71 @@ def auto_job(
     ✅ YA NO ROMPE EL FRONTEND:
     - Si viene Bearer: ok
     - Si NO viene Bearer: usa ?email= + refresh_token guardado en DB
+
+    ✅ FIX:
+    - No asume "primera account"
+    - Descubre locations en TODAS las accounts
+    - 0 -> 422 no_locations
+    - 1 -> autoselecciona y crea job
+    - >1 -> devuelve lista para que el frontend elija (/gbp/create-job)
+    - Autocorrige GoogleOAuth.google_account_id
     """
-    access_token, email_resolved = resolve_access_token(db=db, bearer_token=bearer_token, email=email)
+    access_token, email_resolved = resolve_access_token(
+        db=db, bearer_token=bearer_token, email=email
+    )
 
-    accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
-    if not accounts:
-        raise HTTPException(status_code=404, detail="No se encontraron cuentas GBP")
+    # ✅ NUEVO: buscar TODAS las locations (incluye "account" en cada item)
+    locations_out = discover_locations(access_token)
 
-    locations_out = []
-    for acc in accounts:
-        acc_name = acc.get("name")
-        if not acc_name:
-            continue
+    if len(locations_out) == 0:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_locations",
+                "message": "No se encontraron negocios en tu Google Business Profile o no tienes permisos.",
+            },
+        )
 
-        locs = google_get(
-            GOOGLE_LOCATIONS_URL.format(account=acc_name),
-            access_token,
-            params={"readMask": "name,title,storefrontAddress"},
-        ).get("locations", []) or []
+    # ✅ Si hay más de una, el frontend debe elegir (sin adivinar)
+    if len(locations_out) > 1:
+        return {
+            "status": "choose_location",
+            "email": email_resolved,
+            "locations": [
+                {
+                    "name": l["name"],
+                    "title": l["title"],
+                    "address": l.get("address", ""),
+                }
+                for l in locations_out
+            ],
+        }
 
-        for loc in locs:
-            title = loc.get("title") or "Tu negocio"
-            loc_name = loc.get("name")
-            if not loc_name:
-                continue
+    # ✅ Hay exactamente 1 -> autoselecciona (priorizando account guardado si existe)
+    oauth = (
+        db.query(GoogleOAuth)
+        .filter(GoogleOAuth.email == email_resolved)
+        .first()
+    )
+    preferred_account = oauth.google_account_id if oauth else None
 
-            full_location_name = (
-                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
-            )
-            locations_out.append({"name": full_location_name, "title": title})
-
-    chosen = pick_best_location(locations_out)
+    chosen = pick_best_location(locations_out, preferred_account=preferred_account)
     if not chosen:
-        raise HTTPException(status_code=404, detail="No se encontraron negocios en esta cuenta")
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_locations",
+                "message": "No se encontraron negocios en tu Google Business Profile o no tienes permisos.",
+            },
+        )
 
-    location_name = chosen["name"]
+    # ✅ Autocorrige account guardado (evita el bug de elegir una cuenta vacía)
+    if oauth:
+        oauth.google_account_id = chosen.get("account")
+        db.add(oauth)
+        db.commit()
+
+    location_name = chosen["name"]          # "accounts/.../locations/..."
     place_title = chosen["title"]
 
     job = ScrapeJob(
@@ -334,6 +397,7 @@ def auto_job(
         "place_name": place_title,
         "email": email_resolved,
     }
+
 
 
 @router.get("/last-job")
@@ -417,36 +481,29 @@ def ensure_job_for_email(db: Session, email: str, access_token: str) -> ScrapeJo
     if job:
         return job
 
-    accounts = google_get(GOOGLE_ACCOUNTS_URL, access_token).get("accounts", []) or []
-    if not accounts:
-        raise HTTPException(status_code=404, detail="No se encontraron cuentas GBP")
+    # ✅ NUEVO: descubre locations en TODAS las accounts
+    locations_out = discover_locations(access_token)
 
-    locations_out = []
-    for acc in accounts:
-        acc_name = acc.get("name")
-        if not acc_name:
-            continue
+    # ✅ Preferencia: si ya tenías un account guardado, priolízalo
+    oauth = db.query(GoogleOAuth).filter(GoogleOAuth.email == email).first()
+    preferred_account = oauth.google_account_id if oauth else None
 
-        locs = google_get(
-            GOOGLE_LOCATIONS_URL.format(account=acc_name),
-            access_token,
-            params={"readMask": "name,title,storefrontAddress"},
-        ).get("locations", []) or []
+    chosen = pick_best_location(locations_out, preferred_account=preferred_account)
 
-        for loc in locs:
-            title = loc.get("title") or "Tu negocio"
-            loc_name = loc.get("name")
-            if not loc_name:
-                continue
-
-            full_location_name = (
-                f"{acc_name}/{loc_name}" if loc_name.startswith("locations/") else loc_name
-            )
-            locations_out.append({"name": full_location_name, "title": title})
-
-    chosen = pick_best_location(locations_out)
     if not chosen:
-        raise HTTPException(status_code=404, detail="No se encontraron negocios en esta cuenta")
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "no_locations",
+                "message": "No se encontraron negocios en tu Google Business Profile o no tienes permisos.",
+            },
+        )
+
+    # ✅ Autocorrige el account guardado si estaba mal
+    if oauth:
+        oauth.google_account_id = chosen.get("account")
+        db.add(oauth)
+        db.commit()
 
     location_name = chosen["name"]
     place_title = chosen["title"]
@@ -583,3 +640,111 @@ def sync_gbp_reviews(
         "total_reviews_for_job": total_reviews,
         "synced_at": datetime.now(timezone.utc).isoformat(),
     }
+
+class ChooseLocationBody(BaseModel):
+    location_name: str
+
+
+@router.post("/create-job")
+def create_job_from_location(
+    body: ChooseLocationBody,
+    email: str | None = Query(None),
+    db: Session = Depends(get_db),
+    bearer_token: str | None = Depends(get_access_token_optional),
+):
+    # 1) Resolver access_token (Bearer o refresh_token por email)
+    access_token, email_resolved = resolve_access_token(
+        db=db, bearer_token=bearer_token, email=email
+    )
+
+    # 2) Re-descubrir y validar que la location pertenece a este usuario
+    locations_out = discover_locations(access_token)
+    chosen = next((l for l in locations_out if l["name"] == body.location_name), None)
+    if not chosen:
+        raise HTTPException(status_code=400, detail="location_name inválida para este usuario")
+
+    # 3) Persistir account correcto (autocorrección)
+    oauth = (
+        db.query(GoogleOAuth)
+        .filter(GoogleOAuth.email == email_resolved)
+        .first()
+    )
+    if oauth:
+        oauth.google_account_id = chosen.get("account")
+        db.add(oauth)
+        db.commit()
+
+    # 4) Crear job
+    location_name = chosen["name"]   # "accounts/.../locations/..."
+    place_title = chosen["title"]
+
+    job = ScrapeJob(
+        google_maps_url=location_to_job_url(location_name),
+        place_key=f"user::{email_resolved}::{location_to_place_key(location_name)}",
+        place_name=place_title,
+        actor_id="gbp",
+        status="running",
+        apify_run_id=None,
+        error=None,
+    )
+    db.add(job)
+    db.commit()
+    db.refresh(job)
+
+    # 5) Descargar reviews y guardarlas
+    saved = 0
+    page_token = None
+
+    while True:
+        params = {"pageSize": 50, "orderBy": "updateTime desc"}
+        if page_token:
+            params["pageToken"] = page_token
+
+        data = google_get(
+            GOOGLE_REVIEWS_LIST_URL.format(parent=location_name),
+            access_token,
+            params=params,
+        )
+
+        reviews = data.get("reviews", []) or []
+
+        for r in reviews:
+            db.add(
+                Review(
+                    job_id=job.id,
+                    rating=star_to_int(r.get("starRating")),
+                    text=(r.get("comment") or "").strip(),
+                    published_at=r.get("createTime") or r.get("updateTime"),
+                    author_name=((r.get("reviewer") or {}).get("displayName")) or None,
+                    review_url=r.get("reviewUrl"),
+                    raw=r,
+                )
+            )
+            saved += 1
+
+        if reviews:
+            try:
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                print("❌ DB commit error saving reviews:", repr(e))
+                raise
+
+        page_token = data.get("nextPageToken")
+        if not page_token:
+            break
+
+    # 6) Finalizar job
+    job.status = "done"
+    db.add(job)
+    db.commit()
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "reviews_saved": saved,
+        "location_name": location_name,
+        "place_name": place_title,
+        "email": email_resolved,
+    }
+
