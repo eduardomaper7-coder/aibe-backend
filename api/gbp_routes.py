@@ -6,6 +6,7 @@ from sqlalchemy import func
 import os
 import hashlib
 from datetime import datetime, timezone
+from fastapi import Request
 
 from app.db import get_db
 from app.models import ScrapeJob, Review, GoogleOAuth
@@ -24,14 +25,17 @@ GOOGLE_USERINFO_URL = "https://openidconnect.googleapis.com/v1/userinfo"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
-def get_access_token_optional(
-    creds: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
-) -> str | None:
-    """
-    Devuelve Bearer token si viene, o None si no viene.
-    """
+def get_access_token(
+    request: Request,
+    creds: HTTPAuthorizationCredentials = Security(bearer_scheme),
+) -> str:
+    auth = request.headers.get("authorization")
+    print("🟡 AUTH HEADER RAW:", auth)
+
     if not creds or not creds.credentials:
-        return None
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+
+    print("🟡 TOKEN LEN:", len(creds.credentials))
     return creds.credentials.strip()
 
 
