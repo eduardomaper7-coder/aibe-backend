@@ -35,7 +35,7 @@ from api.nextauth_link import router as nextauth_link_router
 
 from app.review_requests.settings_router import router as settings_router
 
-
+from api.review_import import router as review_import_router
 
 from app.schemas import ScrapeRequest, ScrapeResponse, JobStatusResponse
 from app.models import ScrapeJob, Review
@@ -122,7 +122,7 @@ app.include_router(settings_router)
 app.include_router(gbp_router)
 app.include_router(google_oauth_router)
 app.include_router(nextauth_link_router)
-
+app.include_router(review_import_router)
 from app.review_requests.router import router as review_requests_router
 app.include_router(review_requests_router)
 
