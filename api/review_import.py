@@ -89,7 +89,28 @@ def _extract_from_csv(tmp_path: str) -> List[Dict[str, Any]]:
     return _extract_from_dataframe(df)
 
 def _extract_from_excel(tmp_path: str) -> List[Dict[str, Any]]:
-    df = pd.read_excel(tmp_path)
+    try:
+        # Intento normal
+        df = pd.read_excel(tmp_path)
+    except Exception:
+        # Fallback: leer todas las hojas y unir
+        xls = pd.ExcelFile(tmp_path)
+        frames = []
+        for name in xls.sheet_names:
+            try:
+                frames.append(pd.read_excel(xls, sheet_name=name))
+            except Exception:
+                pass
+
+        if not frames:
+            return []
+
+        df = pd.concat(frames, ignore_index=True)
+
+    # Limpia columnas vacías
+    df = df.dropna(axis=1, how="all")
+    df = df.dropna(axis=0, how="all")
+
     return _extract_from_dataframe(df)
 
 def _best_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
@@ -297,7 +318,6 @@ Archivo: {filename}
     return json.loads(m.group(0))
 
 @router.post("/import-appointments")
-@router.post("/import-appointments")
 async def import_appointments(file: UploadFile = File(...)):
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada en backend")
@@ -311,62 +331,35 @@ async def import_appointments(file: UploadFile = File(...)):
         tmp.write(content)
 
     try:
-        # 1) CSV: determinista -> si calidad baja, fallback a OpenAI
+        # CSV -> OpenAI por TEXTO (no se puede como input_file)
         if _is_csv(filename):
-            items = _extract_from_csv(tmp_path)
-            score = _quality_score(items)
+            with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+                csv_text = f.read()
+            data = _openai_extract_from_text(csv_text, filename)
+            for it in data.get("appointments", []):
+                it["phone"] = _clean_phone(it.get("phone") or "")
+                it["timezone"] = it.get("timezone") or DEFAULT_TZ
+            return JSONResponse({"mode": "openai_csv_text", **data})
 
-            if score < 0.7:
-                data = _openai_extract(tmp_path, filename)
-                for it in data.get("appointments", []):
-                    it["phone"] = _clean_phone(it.get("phone") or "")
-                    it["timezone"] = it.get("timezone") or DEFAULT_TZ
-                return JSONResponse({"mode": "openai_csv_fallback", **data})
-
-            return JSONResponse({
-                "mode": "deterministic_csv",
-                "appointments": items,
-                "score": score,
-            })
-
-        # 2) Excel: determinista -> si calidad baja, fallback a OpenAI
+        # Excel -> OpenAI por TEXTO (convertimos a CSV de las primeras filas)
         if _is_excel(filename):
-            items = _extract_from_excel(tmp_path)
-            score = _quality_score(items)
+            df = pd.read_excel(tmp_path)
+            excel_text = df.head(300).to_csv(index=False)  # ajusta 300 si quieres
+            data = _openai_extract_from_text(excel_text, filename)
+            for it in data.get("appointments", []):
+                it["phone"] = _clean_phone(it.get("phone") or "")
+                it["timezone"] = it.get("timezone") or DEFAULT_TZ
+            return JSONResponse({"mode": "openai_excel_text", **data})
 
-            if score < 0.7:
-                data = _openai_extract(tmp_path, filename)
-                for it in data.get("appointments", []):
-                    it["phone"] = _clean_phone(it.get("phone") or "")
-                    it["timezone"] = it.get("timezone") or DEFAULT_TZ
-                return JSONResponse({"mode": "openai_excel_fallback", **data})
-
-            return JSONResponse({
-                "mode": "deterministic_excel",
-                "appointments": items,
-                "score": score,
-            })
-
-        # 3) PDF: intenta extraer texto; si sale mal, a OpenAI
+        # PDF -> OpenAI con archivo
         if _is_pdf(filename):
-            text = _extract_text_from_pdf(tmp_path)
-
-            # Si no hay texto suficiente, casi seguro escaneado => OpenAI
-            if len(text) < 200:
-                data = _openai_extract(tmp_path, filename)
-                for it in data.get("appointments", []):
-                    it["phone"] = _clean_phone(it.get("phone") or "")
-                    it["timezone"] = it.get("timezone") or DEFAULT_TZ
-                return JSONResponse({"mode": "openai_pdf", **data})
-
-            # PDF con texto: en clínica suele variar mucho -> OpenAI también
             data = _openai_extract(tmp_path, filename)
             for it in data.get("appointments", []):
                 it["phone"] = _clean_phone(it.get("phone") or "")
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
-            return JSONResponse({"mode": "openai_pdf_text", **data})
+            return JSONResponse({"mode": "openai_pdf", **data})
 
-        # 4) Imágenes: OpenAI directo
+        # Imagen -> OpenAI con archivo
         if _is_image(filename):
             data = _openai_extract(tmp_path, filename)
             for it in data.get("appointments", []):
@@ -374,7 +367,7 @@ async def import_appointments(file: UploadFile = File(...)):
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_image", **data})
 
-        # 5) Otros: intenta OpenAI (fallback)
+        # Otros -> intenta OpenAI por archivo (si falla, puedes hacer fallback a texto)
         data = _openai_extract(tmp_path, filename)
         for it in data.get("appointments", []):
             it["phone"] = _clean_phone(it.get("phone") or "")
@@ -386,3 +379,72 @@ async def import_appointments(file: UploadFile = File(...)):
             os.unlink(tmp_path)
         except Exception:
             pass
+def _openai_extract_from_text(text: str, filename: str) -> Dict[str, Any]:
+    import json
+    import re
+
+    # Limita tamaño para no pasar contexto
+    MAX_CHARS = 30000
+    if len(text) > MAX_CHARS:
+        text = text[:MAX_CHARS]
+
+    prompt = f"""
+Eres un extractor automático de citas médicas.
+
+REGLAS:
+- Devuelve SOLO JSON válido.
+- No escribas explicaciones.
+- No uses markdown.
+- No añadas texto fuera del JSON.
+
+Objetivo:
+- Extraer: name, phone, date (YYYY-MM-DD), time (HH:MM 24h).
+- Usa null si falta algo.
+- Añade issues: missing_name / missing_phone / missing_date / missing_time.
+- Normaliza teléfonos a E.164 si es posible (país {DEFAULT_COUNTRY}).
+- timezone: {DEFAULT_TZ}.
+
+Formato obligatorio:
+{{
+  "appointments": [
+    {{
+      "name": null,
+      "phone": null,
+      "date": null,
+      "time": null,
+      "timezone": null,
+      "notes": null,
+      "confidence": 0.0,
+      "issues": []
+    }}
+  ],
+  "unparsed": []
+}}
+
+Contenido del archivo ({filename}):
+{text}
+""".strip()
+
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt}
+                ],
+            }
+        ],
+    )
+
+    out = resp.output_text or ""
+
+    # Busca primer JSON válido en la respuesta
+    match = re.search(r"\{[\s\S]*\}", out)
+
+    if not match:
+        raise ValueError(
+            f"No se encontró JSON válido en la respuesta: {out[:300]}"
+        )
+
+    return json.loads(match.group(0))
