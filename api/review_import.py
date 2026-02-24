@@ -211,17 +211,15 @@ JSON_SCHEMA: Dict[str, Any] = {
 
 def _openai_extract(file_path: str, filename: str) -> Dict[str, Any]:
     import json
+    import re
 
     # Subimos archivo para usarlo como input
     with open(file_path, "rb") as f:
-        uploaded = client.files.create(
-            file=f,
-            purpose="user_data",
-        )
+        uploaded = client.files.create(file=f, purpose="user_data")
 
     prompt = f"""
 Eres un extractor de citas de clínica.
-Devuelve SOLO JSON válido siguiendo el esquema.
+Devuelve SOLO JSON.
 
 Objetivo:
 - Extraer una lista de citas con: name, phone, date (YYYY-MM-DD), time (HH:MM 24h).
@@ -229,13 +227,27 @@ Objetivo:
 - Normaliza teléfonos a E.164 si es posible (por defecto país {DEFAULT_COUNTRY}).
 - timezone por defecto: {DEFAULT_TZ}.
 
+Formato JSON esperado:
+{{
+  "appointments": [
+    {{
+      "name": "string|null",
+      "phone": "string|null",
+      "date": "YYYY-MM-DD|null",
+      "time": "HH:MM|null",
+      "timezone": "string|null",
+      "notes": "string|null",
+      "confidence": 0.0,
+      "issues": ["..."]
+    }}
+  ],
+  "unparsed": ["..."]
+}}
+
 Archivo: {filename}
 """.strip()
 
-    # ✅ Responses API + Structured Outputs (SDK openai 2.x)
-    # Nota: en algunas versiones, el parámetro se llama `response_format` y en otras `format`.
-    # Usamos `format` para evitar el error: unexpected keyword argument 'response_format'
-    resp = client.responses.create(
+    base_payload = dict(
         model="gpt-4.1-mini",
         input=[
             {
@@ -246,15 +258,43 @@ Archivo: {filename}
                 ],
             }
         ],
-        format={
-            "type": "json_schema",
-            "json_schema": JSON_SCHEMA,
-        },
     )
 
-    # En Responses API, el texto final suele estar en output_text
-    data = resp.output_text
-    return json.loads(data)
+    # 1) Intento A: response_format (algunas versiones)
+    try:
+        resp = client.responses.create(
+            **base_payload,
+            response_format={
+                "type": "json_schema",
+                "json_schema": JSON_SCHEMA,
+            },
+        )
+        return json.loads(resp.output_text)
+    except TypeError:
+        pass
+
+    # 2) Intento B: format (otras versiones)
+    try:
+        resp = client.responses.create(
+            **base_payload,
+            format={
+                "type": "json_schema",
+                "json_schema": JSON_SCHEMA,
+            },
+        )
+        return json.loads(resp.output_text)
+    except TypeError:
+        pass
+
+    # 3) Fallback: sin schema (máxima compatibilidad)
+    resp = client.responses.create(**base_payload)
+    text = resp.output_text or ""
+
+    # extrae el primer bloque JSON que encuentre (por si el modelo añade algo)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise ValueError(f"No se encontró JSON en la respuesta: {text[:300]}")
+    return json.loads(m.group(0))
 
 @router.post("/import-appointments")
 async def import_appointments(file: UploadFile = File(...)):
