@@ -341,17 +341,17 @@ async def import_appointments(file: UploadFile = File(...)):
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_csv_text", **data})
 
-        # Excel -> OpenAI por TEXTO (convertimos a CSV de las primeras filas)
+        # Excel -> OpenAI por TEXTO
         if _is_excel(filename):
             df = pd.read_excel(tmp_path)
-            excel_text = df.head(300).to_csv(index=False)  # ajusta 300 si quieres
+            excel_text = df.head(300).to_csv(index=False)
             data = _openai_extract_from_text(excel_text, filename)
             for it in data.get("appointments", []):
                 it["phone"] = _clean_phone(it.get("phone") or "")
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_excel_text", **data})
 
-        # PDF -> OpenAI con archivo
+        # PDF -> OpenAI con archivo (PDF sí soporta input_file)
         if _is_pdf(filename):
             data = _openai_extract(tmp_path, filename)
             for it in data.get("appointments", []):
@@ -359,15 +359,15 @@ async def import_appointments(file: UploadFile = File(...)):
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_pdf", **data})
 
-        # Imagen -> OpenAI con archivo
+        # ✅ Imagen -> OpenAI como input_image (NO input_file)
         if _is_image(filename):
-            data = _openai_extract(tmp_path, filename)
+            data = _openai_extract_image(tmp_path, filename)
             for it in data.get("appointments", []):
                 it["phone"] = _clean_phone(it.get("phone") or "")
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_image", **data})
 
-        # Otros -> intenta OpenAI por archivo (si falla, puedes hacer fallback a texto)
+        # Otros -> intenta OpenAI por archivo
         data = _openai_extract(tmp_path, filename)
         for it in data.get("appointments", []):
             it["phone"] = _clean_phone(it.get("phone") or "")
@@ -448,3 +448,36 @@ Contenido del archivo ({filename}):
         )
 
     return json.loads(match.group(0))
+
+def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
+    import base64, json, re
+
+    with open(file_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    prompt = f"""
+Eres un extractor de citas de clínica.
+Devuelve SOLO JSON válido con este formato:
+{{"appointments":[{{"name":null,"phone":null,"date":null,"time":null,"timezone":null,"notes":null,"confidence":0.0,"issues":[]}}],"unparsed":[]}}
+Archivo: {filename}
+""".strip()
+
+    resp = client.responses.create(
+        model="gpt-4.1-mini",
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": prompt},
+                {
+                    "type": "input_image",
+                    "image_base64": b64,
+                },
+            ],
+        }],
+    )
+
+    out = resp.output_text or ""
+    m = re.search(r"\{[\s\S]*\}", out)
+    if not m:
+        raise ValueError(f"No se encontró JSON en la respuesta: {out[:300]}")
+    return json.loads(m.group(0))
