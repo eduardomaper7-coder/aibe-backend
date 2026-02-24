@@ -297,6 +297,7 @@ Archivo: {filename}
     return json.loads(m.group(0))
 
 @router.post("/import-appointments")
+@router.post("/import-appointments")
 async def import_appointments(file: UploadFile = File(...)):
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada en backend")
@@ -310,56 +311,72 @@ async def import_appointments(file: UploadFile = File(...)):
         tmp.write(content)
 
     try:
-        # 1) Determinista si es CSV/XLSX
+        # 1) CSV: determinista -> si calidad baja, fallback a OpenAI
         if _is_csv(filename):
             items = _extract_from_csv(tmp_path)
+            score = _quality_score(items)
+
+            if score < 0.7:
+                data = _openai_extract(tmp_path, filename)
+                for it in data.get("appointments", []):
+                    it["phone"] = _clean_phone(it.get("phone") or "")
+                    it["timezone"] = it.get("timezone") or DEFAULT_TZ
+                return JSONResponse({"mode": "openai_csv_fallback", **data})
+
             return JSONResponse({
                 "mode": "deterministic_csv",
                 "appointments": items,
-                "score": _quality_score(items),
+                "score": score,
             })
 
+        # 2) Excel: determinista -> si calidad baja, fallback a OpenAI
         if _is_excel(filename):
             items = _extract_from_excel(tmp_path)
+            score = _quality_score(items)
+
+            if score < 0.7:
+                data = _openai_extract(tmp_path, filename)
+                for it in data.get("appointments", []):
+                    it["phone"] = _clean_phone(it.get("phone") or "")
+                    it["timezone"] = it.get("timezone") or DEFAULT_TZ
+                return JSONResponse({"mode": "openai_excel_fallback", **data})
+
             return JSONResponse({
                 "mode": "deterministic_excel",
                 "appointments": items,
-                "score": _quality_score(items),
+                "score": score,
             })
 
-        # 2) PDF: intenta extraer texto; si sale mal, a OpenAI
+        # 3) PDF: intenta extraer texto; si sale mal, a OpenAI
         if _is_pdf(filename):
             text = _extract_text_from_pdf(tmp_path)
-            # Si hay texto “suficiente”, podrías intentar heurísticas propias;
-            # aquí: si no hay texto, casi seguro escaneado => OpenAI
+
+            # Si no hay texto suficiente, casi seguro escaneado => OpenAI
             if len(text) < 200:
                 data = _openai_extract(tmp_path, filename)
-                # post-normalización de teléfonos
-                for it in data["appointments"]:
+                for it in data.get("appointments", []):
                     it["phone"] = _clean_phone(it.get("phone") or "")
                     it["timezone"] = it.get("timezone") or DEFAULT_TZ
                 return JSONResponse({"mode": "openai_pdf", **data})
 
-            # Heurística rápida: extraer teléfonos y horas por regex (muy básica)
-            # Si quieres, lo ampliamos después. Por ahora: usamos OpenAI también,
-            # porque en clínicas el PDF “de texto” sigue variando mucho.
+            # PDF con texto: en clínica suele variar mucho -> OpenAI también
             data = _openai_extract(tmp_path, filename)
-            for it in data["appointments"]:
+            for it in data.get("appointments", []):
                 it["phone"] = _clean_phone(it.get("phone") or "")
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_pdf_text", **data})
 
-        # 3) Imágenes: OpenAI directo
+        # 4) Imágenes: OpenAI directo
         if _is_image(filename):
             data = _openai_extract(tmp_path, filename)
-            for it in data["appointments"]:
+            for it in data.get("appointments", []):
                 it["phone"] = _clean_phone(it.get("phone") or "")
                 it["timezone"] = it.get("timezone") or DEFAULT_TZ
             return JSONResponse({"mode": "openai_image", **data})
 
-        # 4) Otros: intenta OpenAI (fallback)
+        # 5) Otros: intenta OpenAI (fallback)
         data = _openai_extract(tmp_path, filename)
-        for it in data["appointments"]:
+        for it in data.get("appointments", []):
             it["phone"] = _clean_phone(it.get("phone") or "")
             it["timezone"] = it.get("timezone") or DEFAULT_TZ
         return JSONResponse({"mode": "openai_fallback", **data})
