@@ -452,8 +452,20 @@ Contenido del archivo ({filename}):
 def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
     import base64, json, re
 
+    # Detecta mime por extensión (mínimo)
+    ext = (filename or "").lower().split(".")[-1]
+    mime = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "heic": "image/heic",
+    }.get(ext, "image/png")
+
     with open(file_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    data_url = f"data:{mime};base64,{b64}"
 
     prompt = f"""
 Eres un extractor de citas de clínica.
@@ -468,10 +480,7 @@ Archivo: {filename}
             "role": "user",
             "content": [
                 {"type": "input_text", "text": prompt},
-                {
-                    "type": "input_image",
-                    "image_base64": b64,
-                },
+                {"type": "input_image", "image_url": data_url},
             ],
         }],
     )
