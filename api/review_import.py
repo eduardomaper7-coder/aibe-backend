@@ -210,11 +210,14 @@ JSON_SCHEMA: Dict[str, Any] = {
 }
 
 def _openai_extract(file_path: str, filename: str) -> Dict[str, Any]:
+    import json
+
     # Subimos archivo para usarlo como input
-    uploaded = client.files.create(
-        file=open(file_path, "rb"),
-        purpose="user_data",
-    )
+    with open(file_path, "rb") as f:
+        uploaded = client.files.create(
+            file=f,
+            purpose="user_data",
+        )
 
     prompt = f"""
 Eres un extractor de citas de clínica.
@@ -227,30 +230,31 @@ Objetivo:
 - timezone por defecto: {DEFAULT_TZ}.
 
 Archivo: {filename}
-"""
+""".strip()
 
-    # Responses API + Structured Outputs
+    # ✅ Responses API + Structured Outputs (SDK openai 2.x)
+    # Nota: en algunas versiones, el parámetro se llama `response_format` y en otras `format`.
+    # Usamos `format` para evitar el error: unexpected keyword argument 'response_format'
     resp = client.responses.create(
         model="gpt-4.1-mini",
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": prompt},
-                {"type": "input_file", "file_id": uploaded.id},
-            ],
-        }],
-        response_format={
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_file", "file_id": uploaded.id},
+                ],
+            }
+        ],
+        format={
             "type": "json_schema",
-            "json_schema": JSON_SCHEMA
+            "json_schema": JSON_SCHEMA,
         },
     )
 
     # En Responses API, el texto final suele estar en output_text
     data = resp.output_text
-    # output_text ya será JSON string; parseamos:
-    import json
     return json.loads(data)
-
 
 @router.post("/import-appointments")
 async def import_appointments(file: UploadFile = File(...)):
