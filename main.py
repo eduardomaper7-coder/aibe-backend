@@ -27,7 +27,7 @@ from openai import OpenAI
 
 from collections import defaultdict
 from typing import Literal, Optional, List, Dict, Any
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, EmailStr
 from sqlalchemy.orm import Session
 from api.google_oauth import router as google_oauth_router
 
@@ -49,6 +49,11 @@ from api.gbp_routes import router as gbp_router
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security, Header
 from urllib.parse import urlparse, parse_qs, unquote
+
+
+from api.auth_routes import router as auth_router
+from api.jobs_routes import router as jobs_router
+from api.stripe_webhook_routes import router as stripe_webhook_router
 
 
 print("DEBUG OPENAI_API_KEY:", "OK" if os.getenv("OPENAI_API_KEY") else "MISSING")
@@ -129,6 +134,10 @@ app.include_router(nextauth_link_router)
 app.include_router(review_import_router)
 from app.review_requests.router import router as review_requests_router
 app.include_router(review_requests_router)
+
+app.include_router(auth_router)
+app.include_router(jobs_router)
+app.include_router(stripe_webhook_router)
 
 # =========================
 # Rutas
@@ -1435,3 +1444,22 @@ def unwrap_google_consent_url(url: str) -> str:
         return raw
     except Exception:
         return raw
+
+
+
+class SignupIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class LinkJobIn(BaseModel):
+    job_id: int
+    email: EmailStr
+
+
+
+
+
