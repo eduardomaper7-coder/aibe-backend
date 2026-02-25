@@ -1,46 +1,53 @@
 from urllib.parse import urlparse, parse_qs
 import re
 import urllib.parse
-
+from urllib.parse import urlparse, parse_qs
 
 def is_valid_google_maps_url(url: str) -> bool:
     """
     Validación flexible:
-    - dominio contiene google
+    - dominios Google Maps / Google
     - acepta:
         /maps/place
         /maps/reviews
         /maps/search
         /maps?cid=XXXX
+        /maps/place/?q=place_id:XXXX   ✅
+        /maps?q=place_id:XXXX          ✅
+    - NO acepta consent.google.com (eso lo debes "unwrappear" antes)
     """
     try:
-        u = urlparse(url)
+        u = urlparse((url or "").strip())
         host = (u.netloc or "").lower()
         path = (u.path or "").lower()
         qs = parse_qs(u.query)
 
-        # Dominio válido
+        # ❌ Si es consent, no es una URL final válida
+        if "consent.google.com" in host:
+            return False
+
+        # Dominio válido (google maps)
         if "google" not in host:
             return False
 
         # ✅ Caso: https://www.google.com/maps?cid=XXXX
-        if "/maps" in path and "cid" in qs:
+        if path.startswith("/maps") and "cid" in qs:
             return True
 
-        # Debe contener /maps/
-        if "/maps/" not in path:
-            return False
+        # ✅ Caso: place_id en query (aunque path sea /maps o /maps/place)
+        q = (qs.get("q", [None])[0] or "").strip()
+        if "place_id:" in q:
+            return True
 
-        # Subrutas válidas
-        if not (
+        # ✅ Rutas válidas típicas
+        if (
             "/maps/place" in path
             or "/maps/reviews" in path
             or "/maps/search" in path
         ):
-            return False
+            return True
 
-        return True
-
+        return False
     except Exception:
         return False
 

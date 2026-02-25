@@ -48,6 +48,7 @@ from api.gbp_routes import router as gbp_router
 
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security, Header
+from urllib.parse import urlparse, parse_qs, unquote
 
 
 print("DEBUG OPENAI_API_KEY:", "OK" if os.getenv("OPENAI_API_KEY") else "MISSING")
@@ -69,21 +70,24 @@ USE_MOCK_GBP = os.getenv("USE_MOCK_GBP", "true").lower() == "true"
 app = FastAPI(title="AIBE Backend", version="1.0.0")
 security = HTTPBearer()
 
+FRONTEND_ORIGIN_RAW = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+FRONTEND_ORIGINS = [o.strip() for o in FRONTEND_ORIGIN_RAW.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        # Producción
         "https://www.aibetech.es",
         "https://aibetech.es",
+
+        # Local dev
         "http://localhost:3000",
-    ],
+        "http://127.0.0.1:3000",
+    ] + FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 
 @app.get("/")
@@ -221,7 +225,7 @@ def places_search(q: str = Query(..., min_length=2, description="Nombre del nego
             "address": c.get("formatted_address"),
             "rating": c.get("rating"),
             "user_ratings_total": c.get("user_ratings_total"),
-            "google_maps_url": resolve_long_google_maps_url_from_place_id(place_id, hl="es"),
+            "google_maps_url": (place_url or resolve_long_google_maps_url_from_place_id(place_id, hl="es")),
         })
 
     return {"query": q, "candidates": candidates}
@@ -1167,7 +1171,14 @@ def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
         safe_name = incoming_name
 
     # ✅ Normaliza la URL SIEMPRE (evita /maps/search y fuerza hl=es cuando es place_id)
-    normalized_url = normalize_gmaps_url(str(req.google_maps_url))
+    raw_url = str(req.google_maps_url)
+
+    # ✅ 1) Quitar consentimiento si viene
+    raw_url = unwrap_google_consent_url(raw_url)
+    print("🧼 unwrapped_url:", raw_url)
+
+    # ✅ 2) Normalizar
+    normalized_url = normalize_gmaps_url(raw_url)
     print("🔁 normalized_url:", normalized_url)
 
     # Ejecuta el scraping y guarda en SQLite
@@ -1401,3 +1412,26 @@ def debug_google_oauth(
         print("❌ debug_google_oauth error:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
+
+def unwrap_google_consent_url(url: str) -> str:
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    try:
+        u = urlparse(raw)
+        host = (u.netloc or "").lower()
+        if "consent.google.com" not in host:
+            return raw
+
+        qs = parse_qs(u.query)
+        cont = (qs.get("continue", [None])[0] or "").strip()
+        if not cont:
+            return raw
+
+        cont = unquote(cont)
+        if "google.com/maps" in cont or "/maps" in cont:
+            return cont
+
+        return raw
+    except Exception:
+        return raw
