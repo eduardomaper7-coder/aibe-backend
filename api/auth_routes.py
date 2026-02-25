@@ -46,19 +46,40 @@ def signup(payload: SignupIn, db: Session = Depends(get_db)):
 @router.post("/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
+
     row = db.execute(
-        text("select id, email, password_hash from users where email=:e"),
+        text("select id, password_hash from users where email=:e"),
         {"e": email},
     ).fetchone()
 
     if not row:
         raise HTTPException(401, "Invalid credentials")
 
-    user_id, email_db, ph = row
+    user_id, ph = row
+
     if not pwd.verify(payload.password, ph):
         raise HTTPException(401, "Invalid credentials")
 
-    return {"user": {"id": str(user_id), "email": email_db}}
+    # 🔗 Vincular job si viene
+    if payload.job_id:
+        db.execute(
+            text("""
+            update scrape_jobs
+            set user_id=:uid, email=:e
+            where id=:jid
+            """),
+            {
+                "uid": str(user_id),
+                "e": email,
+                "jid": payload.job_id,
+            },
+        )
+        db.commit()
+
+    return {
+        "id": str(user_id),
+        "email": email,
+    }
 
 @router.post("/link-job")
 def link_job(payload: LinkJobIn, db: Session = Depends(get_db)):

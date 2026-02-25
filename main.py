@@ -55,7 +55,7 @@ from api.auth_routes import router as auth_router
 from api.jobs_routes import router as jobs_router
 from api.stripe_webhook_routes import router as stripe_webhook_router
 
-
+from api.stripe_routes import router as stripe_router
 print("DEBUG OPENAI_API_KEY:", "OK" if os.getenv("OPENAI_API_KEY") else "MISSING")
 
 
@@ -138,7 +138,7 @@ app.include_router(review_requests_router)
 app.include_router(auth_router)
 app.include_router(jobs_router)
 app.include_router(stripe_webhook_router)
-
+app.include_router(stripe_router)
 # =========================
 # Rutas
 # =========================
