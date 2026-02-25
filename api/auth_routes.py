@@ -17,6 +17,7 @@ class SignupIn(BaseModel):
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
+    job_id: int | None = None
 
 class LinkJobIn(BaseModel):
     job_id: int
