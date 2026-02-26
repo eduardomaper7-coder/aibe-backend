@@ -979,14 +979,14 @@ async def action_plan(
     # -------------------------
     rows = sig_q.all()
 
-    reviews_for_ai = []
+    reviews_for_ai: list[dict] = []
     for r in rows:
         comment = (r.text or "").strip()
         if not comment:
             continue
         reviews_for_ai.append(
             {
-                "id": r.id,  # ✅ IMPORTANTE: ID REAL
+                "id": r.id,  # ✅ ID REAL
                 "star_rating": int(r.rating or 0),
                 "comment": comment,
             }
@@ -994,7 +994,7 @@ async def action_plan(
 
     negative = [r for r in reviews_for_ai if r["star_rating"] <= 3]
     base = negative if len(negative) >= 5 else reviews_for_ai
-    base = base[-3000:]  # suficiente
+    base = base[-3000:]
 
     system_prompt = (
         "Eres un consultor experto en experiencia de cliente para negocios locales. "
@@ -1046,14 +1046,12 @@ Reglas:
     out = []
     for c in categorias:
         ids = c.get("review_ids") or []
-        # limpiar ids (solo ints)
         ids = [int(x) for x in ids if isinstance(x, (int, str)) and str(x).isdigit()]
 
+        by_id = {}
         if ids:
             db_reviews = db.query(Review).filter(Review.id.in_(ids)).all()
             by_id = {r.id: r for r in db_reviews}
-        else:
-            by_id = {}
 
         reseñas = []
         for rid in ids:
@@ -1090,7 +1088,19 @@ Reglas:
         cache_row.payload_json = payload_json
         cache_row.computed_at = datetime.now(timezone.utc)
     else:
-        cache_row
+        cache_row = AnalysisCache(
+            job_id=job_id,
+            section=section,
+            params_key=params_key,
+            source_reviews_count=source_count,
+            source_max_review_id=source_max_id,
+            payload_json=payload_json,
+            computed_at=datetime.now(timezone.utc),
+        )
+        db.add(cache_row)
+
+    db.commit()
+    return payload
 
 
 def normalize_gmaps_url(url: str) -> str:
