@@ -916,7 +916,6 @@ async def action_plan(
     if not openai_client:
         raise HTTPException(500, "IA no configurada")
 
-    # DEBUG: confirma que entra y con qué params
     print("🔥 HIT /reviews/action-plan", {
         "job_id": job_id, "from": date_from, "to": date_to, "max_categories": max_categories
     })
@@ -990,7 +989,7 @@ async def action_plan(
     # -------------------------
     rows = sig_q.all()
 
-    reviews = []
+    reviews: list[dict] = []
     for r in rows:
         comment = (r.text or "").strip()
         if not comment:
@@ -1001,6 +1000,7 @@ async def action_plan(
                 "star_rating": int(r.rating or 0),
                 "comment": comment,
                 "reviewer_name": r.author_name or "Cliente",
+                "fecha_publicacion": r.published_at or "",  # ✅ NUEVO
             }
         )
 
@@ -1013,8 +1013,9 @@ async def action_plan(
         "Analizas reseñas reales y propones oportunidades de mejora accionables."
     )
 
+    # ✅ NUEVO: pedir a la IA rating + fecha_publicacion por reseña
     user_prompt = f"""
-Estas son reseñas reales:
+Estas son reseñas reales (JSON):
 
 {json.dumps(base, ensure_ascii=False)}
 
@@ -1027,7 +1028,12 @@ Devuelve SOLO este JSON:
       "dato": "Insight",
       "oportunidad": "Acción",
       "reseñas": [
-        {{"autor": "Nombre", "texto": "Texto"}}
+        {{
+          "autor": "Nombre",
+          "texto": "Texto",
+          "rating": 5,
+          "fecha_publicacion": "2025-01-10T12:00:00Z"
+        }}
       ]
     }}
   ]
@@ -1048,6 +1054,28 @@ Máximo {max_categories}.
 
         parsed = json.loads(completion.choices[0].message.content or "{}")
         categorias = parsed.get("categorias") or []
+
+        # ✅ NUEVO: fallback/normalización por si la IA no devuelve rating/fecha
+        lookup: dict[tuple[str, str], dict] = {}
+        for r in base:
+            key = (
+                str(r.get("reviewer_name", "")).strip().lower(),
+                str(r.get("comment", "")).strip(),
+            )
+            lookup[key] = r
+
+        for c in categorias:
+            for rr in (c.get("reseñas") or []):
+                autor_norm = str(rr.get("autor", "")).strip().lower()
+                texto_norm = str(rr.get("texto", "")).strip()
+                src = lookup.get((autor_norm, texto_norm))
+
+                if src:
+                    rr["rating"] = rr.get("rating") or src.get("star_rating", 0)
+                    rr["fecha_publicacion"] = rr.get("fecha_publicacion") or src.get("fecha_publicacion", "")
+                else:
+                    rr["rating"] = rr.get("rating") or 0
+                    rr["fecha_publicacion"] = rr.get("fecha_publicacion") or ""
 
     except Exception as e:
         print("⚠️ IA action_plan:", repr(e))
