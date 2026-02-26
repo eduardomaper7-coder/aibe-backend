@@ -936,7 +936,7 @@ async def action_plan(
     section = "action_plan"
 
     # -------------------------
-    # 2) Firma dataset
+    # 2) Dataset (firma)
     # -------------------------
     base_q = db.query(Review).filter(Review.job_id == job_id)
 
@@ -952,11 +952,10 @@ async def action_plan(
     source_max_id = sig_q.with_entities(func.max(Review.id)).scalar() or 0
 
     if source_count == 0:
-        print("⚠️ action_plan: 0 reviews con texto")
         return {"categorias": []}
 
     # -------------------------
-    # 3) Buscar caché
+    # 3) Cache
     # -------------------------
     cache_row = (
         db.query(AnalysisCache)
@@ -973,49 +972,37 @@ async def action_plan(
         and cache_row.source_reviews_count == source_count
         and cache_row.source_max_review_id == source_max_id
     ):
-        print("✅ action_plan CACHE HIT", {
-            "job_id": job_id, "params_key": params_key,
-            "count": source_count, "max_id": source_max_id
-        })
         return json.loads(cache_row.payload_json)
 
-    print("🧠 action_plan CACHE MISS", {
-        "job_id": job_id, "params_key": params_key,
-        "count": source_count, "max_id": source_max_id
-    })
-
     # -------------------------
-    # 4) Cache miss → IA
+    # 4) IA (solo categorías + IDs)
     # -------------------------
     rows = sig_q.all()
 
-    reviews: list[dict] = []
+    reviews_for_ai = []
     for r in rows:
         comment = (r.text or "").strip()
         if not comment:
             continue
-        reviews.append(
+        reviews_for_ai.append(
             {
-                "id": r.id,
+                "id": r.id,  # ✅ IMPORTANTE: ID REAL
                 "star_rating": int(r.rating or 0),
                 "comment": comment,
-                "reviewer_name": r.author_name or "Cliente",
-                "fecha_publicacion": r.published_at or "",  # ✅ NUEVO
             }
         )
 
-    negative = [r for r in reviews if r["star_rating"] <= 3]
-    base = negative if len(negative) >= 5 else reviews
-    base = base[-10000:]
+    negative = [r for r in reviews_for_ai if r["star_rating"] <= 3]
+    base = negative if len(negative) >= 5 else reviews_for_ai
+    base = base[-3000:]  # suficiente
 
     system_prompt = (
         "Eres un consultor experto en experiencia de cliente para negocios locales. "
         "Analizas reseñas reales y propones oportunidades de mejora accionables."
     )
 
-    # ✅ NUEVO: pedir a la IA rating + fecha_publicacion por reseña
     user_prompt = f"""
-Estas son reseñas reales (JSON):
+Estas son reseñas reales (JSON). Cada reseña tiene un id:
 
 {json.dumps(base, ensure_ascii=False)}
 
@@ -1025,21 +1012,17 @@ Devuelve SOLO este JSON:
   "categorias": [
     {{
       "categoria": "Nombre",
-      "dato": "Insight",
-      "oportunidad": "Acción",
-      "reseñas": [
-        {{
-          "autor": "Nombre",
-          "texto": "Texto",
-          "rating": 5,
-          "fecha_publicacion": "2025-01-10T12:00:00Z"
-        }}
-      ]
+      "dato": "Insight basado en las reseñas",
+      "oportunidad": "Acción concreta y accionable",
+      "review_ids": [123, 456, 789]
     }}
   ]
 }}
 
-Máximo {max_categories}.
+Reglas:
+- Usa SOLO ids que existan en el JSON de entrada.
+- Máximo {max_categories} categorías.
+- 2 a 4 ids por categoría.
 """
 
     try:
@@ -1051,41 +1034,55 @@ Máximo {max_categories}.
             ],
             temperature=0.3,
         )
-
         parsed = json.loads(completion.choices[0].message.content or "{}")
         categorias = parsed.get("categorias") or []
-
-        # ✅ NUEVO: fallback/normalización por si la IA no devuelve rating/fecha
-        lookup: dict[tuple[str, str], dict] = {}
-        for r in base:
-            key = (
-                str(r.get("reviewer_name", "")).strip().lower(),
-                str(r.get("comment", "")).strip(),
-            )
-            lookup[key] = r
-
-        for c in categorias:
-            for rr in (c.get("reseñas") or []):
-                autor_norm = str(rr.get("autor", "")).strip().lower()
-                texto_norm = str(rr.get("texto", "")).strip()
-                src = lookup.get((autor_norm, texto_norm))
-
-                if src:
-                    rr["rating"] = rr.get("rating") or src.get("star_rating", 0)
-                    rr["fecha_publicacion"] = rr.get("fecha_publicacion") or src.get("fecha_publicacion", "")
-                else:
-                    rr["rating"] = rr.get("rating") or 0
-                    rr["fecha_publicacion"] = rr.get("fecha_publicacion") or ""
-
     except Exception as e:
         print("⚠️ IA action_plan:", repr(e))
         categorias = []
 
-    payload = {"categorias": categorias}
+    # -------------------------
+    # 5) Construir reseñas desde BD (rating+fecha reales)
+    # -------------------------
+    out = []
+    for c in categorias:
+        ids = c.get("review_ids") or []
+        # limpiar ids (solo ints)
+        ids = [int(x) for x in ids if isinstance(x, (int, str)) and str(x).isdigit()]
+
+        if ids:
+            db_reviews = db.query(Review).filter(Review.id.in_(ids)).all()
+            by_id = {r.id: r for r in db_reviews}
+        else:
+            by_id = {}
+
+        reseñas = []
+        for rid in ids:
+            r = by_id.get(rid)
+            if not r:
+                continue
+            reseñas.append(
+                {
+                    "autor": r.author_name or "Cliente",
+                    "texto": (r.text or "").strip(),
+                    "rating": int(r.rating or 0),
+                    "fecha_publicacion": r.published_at or "",
+                }
+            )
+
+        out.append(
+            {
+                "categoria": c.get("categoria", ""),
+                "dato": c.get("dato", ""),
+                "oportunidad": c.get("oportunidad", ""),
+                "reseñas": reseñas,
+            }
+        )
+
+    payload = {"categorias": out}
     payload_json = json.dumps(payload, ensure_ascii=False)
 
     # -------------------------
-    # 5) Guardar caché
+    # 6) Guardar cache
     # -------------------------
     if cache_row:
         cache_row.source_reviews_count = source_count
@@ -1093,29 +1090,7 @@ Máximo {max_categories}.
         cache_row.payload_json = payload_json
         cache_row.computed_at = datetime.now(timezone.utc)
     else:
-        cache_row = AnalysisCache(
-            job_id=job_id,
-            section=section,
-            params_key=params_key,
-            source_reviews_count=source_count,
-            source_max_review_id=source_max_id,
-            payload_json=payload_json,
-            computed_at=datetime.now(timezone.utc),
-        )
-        db.add(cache_row)
-
-    db.commit()
-    try:
-        db.refresh(cache_row)
-    except Exception:
-        pass
-
-    print("💾 action_plan cache guardado", {
-        "id": getattr(cache_row, "id", None),
-        "job_id": job_id, "section": section
-    })
-
-    return payload
+        cache_row
 
 
 def normalize_gmaps_url(url: str) -> str:
