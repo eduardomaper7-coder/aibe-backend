@@ -2,11 +2,23 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from app.db import get_db
-
+import os
+from fastapi import Query
 router = APIRouter(tags=["jobs"])
 
+ADMIN_UNLOCK_KEY = os.getenv("ADMIN_UNLOCK_KEY")
+
+
 @router.get("/jobs/{job_id}/entitlements")
-def entitlements(job_id: int, db: Session = Depends(get_db)):
+def entitlements(
+    job_id: int,
+    admin_unlock: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+):
+
+    # 🔐 Override manual por URL
+    if ADMIN_UNLOCK_KEY and admin_unlock == ADMIN_UNLOCK_KEY:
+        return {"isPro": True}
 
     row = db.execute(
         text("""
