@@ -65,6 +65,8 @@ class BusinessSettingsOut(BaseModel):
     google_review_url: Optional[str] = None
     business_name: Optional[str] = None
 
+    prevent_duplicate_whatsapp: bool = False
+ 
     class Config:
         from_attributes = True
 
@@ -74,4 +76,7 @@ class BusinessSettingsUpsert(BaseModel):
     google_place_id: Optional[str] = None
     google_review_url: Optional[str] = None
     business_name: Optional[str] = None
+
+
+    prevent_duplicate_whatsapp: Optional[bool] = None
 

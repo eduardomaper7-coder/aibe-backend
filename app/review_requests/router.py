@@ -64,6 +64,7 @@ def get_settings(job_id: int = Query(...), db: Session = Depends(get_db)):
             "google_place_id": None,
             "google_review_url": None,
             "business_name": None,
+            "prevent_duplicate_whatsapp": False,  # ✅ nuevo
         }
 
     return bs
@@ -74,9 +75,10 @@ def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_d
     bs = repo.upsert_business_settings(
         db,
         job_id=payload.job_id,
-        google_place_id=payload.google_place_id,  # ✅ ok
+        google_place_id=payload.google_place_id,
         google_review_url=payload.google_review_url,
         business_name=payload.business_name,
+        prevent_duplicate_whatsapp=payload.prevent_duplicate_whatsapp,  # ✅ nuevo
     )
 
     if not bs:

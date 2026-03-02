@@ -22,6 +22,28 @@ def create_review_request(
     appointment_at: datetime,
     send_at: datetime,
 ) -> ReviewRequest:
+    # ✅ leer setting (si no existe, false)
+    bs = db.get(BusinessSettings, job_id)
+    prevent = bool(getattr(bs, "prevent_duplicate_whatsapp", False)) if bs else False
+
+    # ✅ si está activado y ya hubo un "sent" a ese teléfono -> crear como cancelado automático
+    if prevent and already_sent_to_phone(db, job_id=job_id, phone_e164=phone_e164):
+        rr = ReviewRequest(
+            job_id=job_id,
+            customer_name=customer_name,
+            phone_e164=phone_e164,
+            appointment_at=appointment_at,
+            send_at=send_at,
+            status=ReviewRequestStatus.cancelled,
+            cancelled_at=utcnow(),
+            error_message="ALREADY_SENT",
+        )
+        db.add(rr)
+        db.commit()
+        db.refresh(rr)
+        return rr
+
+    # ✅ caso normal
     rr = ReviewRequest(
         job_id=job_id,
         customer_name=customer_name,
@@ -35,6 +57,19 @@ def create_review_request(
     db.refresh(rr)
     return rr
 
+def already_sent_to_phone(db: Session, *, job_id: int, phone_e164: str) -> bool:
+    stmt = (
+        select(ReviewRequest.id)
+        .where(
+            and_(
+                ReviewRequest.job_id == job_id,
+                ReviewRequest.phone_e164 == phone_e164,
+                ReviewRequest.status == ReviewRequestStatus.sent,
+            )
+        )
+        .limit(1)
+    )
+    return db.execute(stmt).scalar() is not None
 
 def list_review_requests(db: Session, *, job_id: int, limit: int = 200) -> list[ReviewRequest]:
     stmt = (
@@ -178,23 +213,20 @@ def upsert_business_settings(
     google_place_id: Optional[str] = None,
     google_review_url: Optional[str] = None,
     business_name: Optional[str] = None,
+    prevent_duplicate_whatsapp: Optional[bool] = None,  # ✅ nuevo
 ) -> BusinessSettings:
     bs = db.get(BusinessSettings, job_id)
     if not bs:
         bs = BusinessSettings(job_id=job_id)
         db.add(bs)
 
-    if google_place_id is not None:
-        bs.google_place_id = google_place_id.strip() if google_place_id else None
-        # si llega place_id y no llega url, la generamos
-        if bs.google_place_id and not (bs.google_review_url or "").strip():
-            bs.google_review_url = f"https://search.google.com/local/writereview?placeid={bs.google_place_id}"
-
-    if google_review_url is not None:
-        bs.google_review_url = google_review_url.strip() if google_review_url else None
-
+    ...
     if business_name is not None:
         bs.business_name = business_name.strip() if business_name else None
+
+    # ✅ nuevo
+    if prevent_duplicate_whatsapp is not None:
+        bs.prevent_duplicate_whatsapp = bool(prevent_duplicate_whatsapp)
 
     db.commit()
     db.refresh(bs)
