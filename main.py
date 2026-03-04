@@ -48,7 +48,7 @@ from api.gbp_routes import router as gbp_router
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security, Header
 from urllib.parse import urlparse, parse_qs, unquote
-
+from api.cron_routes import router as cron_router
 
 from api.auth_routes import router as auth_router
 from api.jobs_routes import router as jobs_router
@@ -132,7 +132,7 @@ app.include_router(nextauth_link_router)
 app.include_router(review_import_router)
 from app.review_requests.router import router as review_requests_router
 app.include_router(review_requests_router)
-
+app.include_router(cron_router)
 app.include_router(auth_router)
 app.include_router(jobs_router)
 app.include_router(stripe_webhook_router)

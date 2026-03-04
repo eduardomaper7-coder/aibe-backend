@@ -1,8 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from app.db import get_db
-from fastapi import Depends
 import uuid
 from passlib.context import CryptContext
 from sqlalchemy import text
@@ -10,18 +9,22 @@ from sqlalchemy import text
 router = APIRouter(prefix="/auth", tags=["auth"])
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+
 class SignupIn(BaseModel):
     email: EmailStr
     password: str
+
 
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
     job_id: int | None = None
 
+
 class LinkJobIn(BaseModel):
     job_id: int
     email: EmailStr
+
 
 @router.post("/signup")
 def signup(payload: SignupIn, db: Session = Depends(get_db)):
@@ -44,6 +47,7 @@ def signup(payload: SignupIn, db: Session = Depends(get_db)):
     db.commit()
     return {"ok": True}
 
+
 @router.post("/login")
 def login(payload: LoginIn, db: Session = Depends(get_db)):
     email = payload.email.lower().strip()
@@ -61,26 +65,22 @@ def login(payload: LoginIn, db: Session = Depends(get_db)):
     if not pwd.verify(payload.password, ph):
         raise HTTPException(401, "Invalid credentials")
 
-    # 🔗 Vincular job si viene
+    # Vincular job si viene
     if payload.job_id:
         db.execute(
-            text("""
-            update scrape_jobs
-            set user_id=:uid, email=:e
-            where id=:jid
-            """),
-            {
-                "uid": str(user_id),
-                "e": email,
-                "jid": payload.job_id,
-            },
+            text(
+                """
+                update scrape_jobs
+                set user_id=:uid, email=:e
+                where id=:jid
+                """
+            ),
+            {"uid": str(user_id), "e": email, "jid": payload.job_id},
         )
         db.commit()
 
-    return {
-        "id": str(user_id),
-        "email": email,
-    }
+    return {"id": str(user_id), "email": email}
+
 
 @router.post("/link-job")
 def link_job(payload: LinkJobIn, db: Session = Depends(get_db)):
@@ -98,3 +98,17 @@ def link_job(payload: LinkJobIn, db: Session = Depends(get_db)):
     )
     db.commit()
     return {"ok": True}
+
+
+@router.get("/job-linked")
+def job_linked(job_id: int, db: Session = Depends(get_db)):
+    row = db.execute(
+        text("select user_id, email from scrape_jobs where id=:jid"),
+        {"jid": job_id},
+    ).fetchone()
+
+    if not row:
+        return {"linked": False}
+
+    user_id, email = row
+    return {"linked": bool(user_id or email)}
