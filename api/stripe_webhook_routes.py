@@ -19,8 +19,24 @@ def checkout_completed(payload: CheckoutCompletedIn, db: Session = Depends(get_d
     db.execute(
         text(
             """
-            insert into subscriptions (user_id, job_id, subscription_id, status, plan, credit_eur)
-            values (:uid, :jid, :sid, 'active', :plan, :credit)
+            insert into subscriptions (
+              user_id,
+              job_id,
+              subscription_id,
+              status,
+              plan,
+              credit_eur,
+              updated_at
+            )
+            values (
+              :uid,
+              :jid,
+              :sid,
+              'active',
+              :plan,
+              :credit,
+              now()
+            )
             on conflict (subscription_id)
             do update set
               status='active',
