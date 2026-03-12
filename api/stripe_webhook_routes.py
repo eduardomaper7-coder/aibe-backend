@@ -97,3 +97,37 @@ def checkout_completed(payload: CheckoutCompletedIn, db: Session = Depends(get_d
 
     db.commit()
     return {"ok": True}
+
+
+class InvoicePaidIn(BaseModel):
+    subscription_id: str
+    status: str | None = None
+
+
+@router.post("/invoice-paid")
+def invoice_paid(payload: InvoicePaidIn, db: Session = Depends(get_db)):
+    sid = payload.subscription_id
+
+    db.execute(
+        text("""
+            update subscriptions
+            set
+              status = 'active',
+              activated_at = now(),
+              updated_at = now()
+            where subscription_id = :sid
+        """),
+        {"sid": sid},
+    )
+
+    db.execute(
+        text("""
+            update users
+            set subscription_status = 'active'
+            where subscription_id = :sid
+        """),
+        {"sid": sid},
+    )
+
+    db.commit()
+    return {"ok": True}
