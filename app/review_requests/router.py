@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-
+from app.billing_service import maybe_activate_subscription_after_25_reviews
 from .sender import process_pending
 from app.db import get_db
 from app.reviews_service import check_and_store_latest_reviews
@@ -95,12 +95,25 @@ def stats(job_id: int = Query(...), db: Session = Depends(get_db)):
 @router.post("/review-requests/check-new-reviews")
 def check_new_reviews(job_id: int = Query(...), db: Session = Depends(get_db)):
     try:
-        return check_and_store_latest_reviews(db, job_id=job_id, personal_data=True)
+        result = check_and_store_latest_reviews(db, job_id=job_id, personal_data=True)
+
+        stats_data = repo.get_stats(db, job_id=job_id)
+        reviews_gained = int((stats_data or {}).get("reviews_gained") or 0)
+
+        activation = maybe_activate_subscription_after_25_reviews(
+            db=db,
+            job_id=job_id,
+            reviews_gained=reviews_gained,
+        )
+
+        result["subscription_activation"] = activation
+        result["reviews_gained"] = reviews_gained
+        return result
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error comprobando reseñas: {e}")
-
 
 @router.post("/review-requests/send-due")
 def send_due(db: Session = Depends(get_db)):
