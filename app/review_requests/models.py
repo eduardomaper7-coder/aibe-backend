@@ -1,5 +1,3 @@
-# app/review_requests/models.py
-
 import enum
 from sqlalchemy import (
     Column,
@@ -68,7 +66,7 @@ Index(
 
 class BusinessSettings(Base):
     __tablename__ = "business_settings"
-    __table_args__ = {"extend_existing": True}  # ✅ evita error de redefinición
+    __table_args__ = {"extend_existing": True}
 
     job_id = Column(Integer, primary_key=True)
 
@@ -76,7 +74,6 @@ class BusinessSettings(Base):
     google_review_url = Column(Text, nullable=True)
     business_name = Column(String(200), nullable=True)
 
-    # ✅ NUEVO: evitar duplicados de WhatsApp
     prevent_duplicate_whatsapp = Column(
         Boolean,
         nullable=False,

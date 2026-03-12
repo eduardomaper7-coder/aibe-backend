@@ -531,6 +531,7 @@ from app.models import Review
 print("🧩 DB URL:", engine.url)
 
 
+
 @app.get("/reviews/sentiment-summary")
 async def sentiment_summary(
     job_id: int = Query(..., description="ID del job de scraping"),
@@ -539,12 +540,11 @@ async def sentiment_summary(
     bucket: Literal["day", "week", "month"] = Query("day"),
     db: Session = Depends(get_db),
 ):
-
-
     q = db.query(Review).filter(Review.job_id == job_id)
     rows = q.all()
 
-    from datetime import datetime
+    from datetime import datetime, date
+    from collections import defaultdict
 
     def parse_dt_safe(v: str | None):
         if not v:
@@ -559,10 +559,13 @@ async def sentiment_summary(
         dt = parse_dt_safe(r.published_at)
         if not dt:
             continue
+
         if date_from and dt.date() < datetime.fromisoformat(date_from).date():
             continue
+
         if date_to and dt.date() > datetime.fromisoformat(date_to).date():
             continue
+
         filtered_rows.append(r)
 
     rows = filtered_rows
@@ -579,6 +582,7 @@ async def sentiment_summary(
     # ---------------------------
     # 2) Métricas globales
     # ---------------------------
+
     ratings = [int(r.rating or 0) for r in rows]
     total_reviews = len(ratings)
     avg_rating = sum(ratings) / total_reviews if total_reviews else 0
@@ -591,7 +595,11 @@ async def sentiment_summary(
         else:
             return "negative"
 
-    breakdown_counts = {"positive": 0, "neutral": 0, "negative": 0}
+    breakdown_counts = {
+        "positive": 0,
+        "neutral": 0,
+        "negative": 0,
+    }
 
     for s in ratings:
         breakdown_counts[label_from_star(s)] += 1
@@ -605,6 +613,7 @@ async def sentiment_summary(
     # ---------------------------
     # 3) Agregación por bucket
     # ---------------------------
+
     def parse_date(v: str) -> date:
         return datetime.fromisoformat(v[:10]).date()
 
@@ -618,9 +627,11 @@ async def sentiment_summary(
 
         if bucket == "day":
             key = d.strftime("%Y-%m-%d")
+
         elif bucket == "week":
             y, w, _ = d.isocalendar()
             key = f"{y}-W{w:02d}"
+
         else:  # month
             key = d.strftime("%Y-%m")
 
@@ -638,6 +649,7 @@ async def sentiment_summary(
     # ---------------------------
     # 4) Respuesta final
     # ---------------------------
+
     return {
         "total_reviews": total_reviews,
         "avg_rating": avg_rating,
@@ -645,7 +657,6 @@ async def sentiment_summary(
         "trend": trend,
         "bucket_type": bucket,
     }
-
 
 from typing import Literal
 

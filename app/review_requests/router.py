@@ -1,4 +1,3 @@
-# app/review_requests/router.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -6,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from .sender import process_pending
 from app.db import get_db
+from app.reviews_service import check_and_store_latest_reviews
 
 from .schemas import (
     ReviewRequestCreate,
@@ -64,7 +64,7 @@ def get_settings(job_id: int = Query(...), db: Session = Depends(get_db)):
             "google_place_id": None,
             "google_review_url": None,
             "business_name": None,
-            "prevent_duplicate_whatsapp": False,  # ✅ nuevo
+            "prevent_duplicate_whatsapp": False,
         }
 
     return bs
@@ -78,7 +78,7 @@ def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_d
         google_place_id=payload.google_place_id,
         google_review_url=payload.google_review_url,
         business_name=payload.business_name,
-        prevent_duplicate_whatsapp=payload.prevent_duplicate_whatsapp,  # ✅ nuevo
+        prevent_duplicate_whatsapp=payload.prevent_duplicate_whatsapp,
     )
 
     if not bs:
@@ -92,7 +92,16 @@ def stats(job_id: int = Query(...), db: Session = Depends(get_db)):
     return repo.get_stats(db, job_id=job_id)
 
 
+@router.post("/review-requests/check-new-reviews")
+def check_new_reviews(job_id: int = Query(...), db: Session = Depends(get_db)):
+    try:
+        return check_and_store_latest_reviews(db, job_id=job_id, personal_data=True)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error comprobando reseñas: {e}")
+
+
 @router.post("/review-requests/send-due")
 def send_due(db: Session = Depends(get_db)):
-    # ✅ aquí es donde se resuelve placeId/url y se envía (vía sender.process_pending)
     return process_pending(db)
