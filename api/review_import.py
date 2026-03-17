@@ -648,12 +648,23 @@ def _parse_nested_patients_json(data: dict) -> Optional[Dict[str, Any]]:
     for p in pacientes:
         nombre = (p.get("nombre") or "").strip()
         apellidos = (p.get("apellidos") or "").strip()
-        full_name = " ".join(x for x in [nombre, apellidos] if x).strip() or None
-        phone = _clean_phone(str(p.get("movil") or p.get("telefono") or "").strip()) if (p.get("movil") or p.get("telefono")) else None
+
+        full_name = " ".join(
+            part for part in [nombre, apellidos] if part
+        ).strip() or None
+
+        phone_raw = (
+            p.get("movil")
+            or p.get("mobile")
+            or p.get("telefono")
+            or p.get("teléfono")
+            or p.get("phone")
+        )
+
+        phone = _clean_phone(str(phone_raw).strip()) if phone_raw else None
 
         procesos = p.get("procesos") or []
 
-        # Si el JSON no trae citas, guardamos solo paciente parcial
         if not procesos:
             issues = []
             if not full_name:
@@ -726,7 +737,6 @@ def _parse_nested_patients_json(data: dict) -> Optional[Dict[str, Any]]:
         "appointments": appointments,
         "unparsed": [],
     }
-
 
 def _parse_structured_file(tmp_path: str, filename: str):
     try:
