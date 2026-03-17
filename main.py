@@ -33,6 +33,8 @@ from api.google_oauth import router as google_oauth_router
 
 from api.nextauth_link import router as nextauth_link_router
 
+from app.review_requests import models as review_request_models
+from app.review_requests import import_models as review_import_models
 
 from api.review_import import router as review_import_router
 

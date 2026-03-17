@@ -8,6 +8,7 @@ from sqlalchemy import (
     Enum,
     Index,
     Boolean,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 
@@ -23,6 +24,14 @@ class ReviewRequestStatus(str, enum.Enum):
 
 class ReviewRequest(Base):
     __tablename__ = "review_requests"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id",
+            "phone_e164",
+            "appointment_at",
+            name="uq_review_request_job_phone_appointment",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     job_id = Column(Integer, nullable=False, index=True)
