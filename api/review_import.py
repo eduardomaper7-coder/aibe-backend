@@ -88,15 +88,13 @@ def _gunzip_file(tmp_path: str, filename: str) -> tuple[str, str]:
     original_name = filename[:-3] if filename.lower().endswith(".gz") else filename
     inner_suffix = os.path.splitext(original_name)[1]
 
-
     with tempfile.NamedTemporaryFile(delete=False, suffix=inner_suffix or "") as out:
         out_path = out.name
-
 
     with gzip.open(tmp_path, "rb") as gz_in, open(out_path, "wb") as f_out:
         shutil.copyfileobj(gz_in, f_out)
 
-
+    print(f"📦 gunzip completado: {filename} -> {original_name} ({out_path})")
     return out_path, original_name
 
 
@@ -435,11 +433,23 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
             if df is not None and not df.empty:
                 print(f"📊 archivo sin extensión tratado como CSV: {filename}")
 
-                columns_map = {str(c).lower(): c for c in df.columns}
-                phone_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["phone", "movil", "mobile", "tel", "telefono"])]
-                name_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["name", "patient", "nombre", "paciente"])]
-                date_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["date", "fecha", "dia", "día"])]
-                time_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["time", "hora"])]
+                columns_map = {str(c).strip().lower(): c for c in df.columns}
+                phone_cols = [
+                    orig for low, orig in columns_map.items()
+                    if any(k in low for k in ["phone", "movil", "móvil", "mobile", "tel", "telefono", "teléfono"])
+                ]
+                name_cols = [
+                    orig for low, orig in columns_map.items()
+                    if any(k in low for k in ["name", "patient", "nombre", "paciente", "cliente"])
+                ]
+                date_cols = [
+                    orig for low, orig in columns_map.items()
+                    if any(k in low for k in ["date", "fecha", "dia", "día"])
+                ]
+                time_cols = [
+                    orig for low, orig in columns_map.items()
+                    if any(k in low for k in ["time", "hora", "inicio"])
+                ]
 
                 appointments = []
                 for _, row in df.iterrows():
@@ -449,10 +459,10 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                     time = row.get(time_cols[0]) if time_cols else None
 
                     appointments.append({
-                        "name": str(name).strip() if name else None,
-                        "phone": _clean_phone(str(phone)) if phone else None,
-                        "date": str(date).strip() if date else None,
-                        "time": str(time).strip() if time else None,
+                        "name": str(name).strip() if name is not None and str(name).strip() else None,
+                        "phone": _clean_phone(str(phone)) if phone is not None and str(phone).strip() else None,
+                        "date": str(date).strip() if date is not None and str(date).strip() else None,
+                        "time": str(time).strip()[:5] if time is not None and str(time).strip() else None,
                         "timezone": DEFAULT_TZ,
                         "notes": None,
                         "confidence": 1.0,
@@ -471,6 +481,11 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
             with open(tmp_path, "r", encoding="utf-8") as f:
                 raw = json.load(f)
 
+            nested = _parse_nested_patients_json(raw) if isinstance(raw, dict) else None
+            if nested:
+                print(f"🧾 archivo sin extensión tratado como JSON anidado: {filename}")
+                return _normalize_extracted_appointments(nested)
+
             if isinstance(raw, dict):
                 if "pacientes" in raw and isinstance(raw["pacientes"], list):
                     data = raw["pacientes"]
@@ -486,11 +501,23 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                 if not df.empty:
                     print(f"🧾 archivo sin extensión tratado como JSON: {filename}")
 
-                    columns_map = {str(c).lower(): c for c in df.columns}
-                    phone_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["phone", "movil", "mobile", "tel", "telefono"])]
-                    name_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["name", "patient", "nombre", "paciente"])]
-                    date_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["date", "fecha", "dia", "día"])]
-                    time_cols = [orig for low, orig in columns_map.items() if any(k in low for k in ["time", "hora"])]
+                    columns_map = {str(c).strip().lower(): c for c in df.columns}
+                    phone_cols = [
+                        orig for low, orig in columns_map.items()
+                        if any(k in low for k in ["phone", "movil", "móvil", "mobile", "tel", "telefono", "teléfono"])
+                    ]
+                    name_cols = [
+                        orig for low, orig in columns_map.items()
+                        if any(k in low for k in ["name", "patient", "nombre", "paciente", "cliente"])
+                    ]
+                    date_cols = [
+                        orig for low, orig in columns_map.items()
+                        if any(k in low for k in ["date", "fecha", "dia", "día"])
+                    ]
+                    time_cols = [
+                        orig for low, orig in columns_map.items()
+                        if any(k in low for k in ["time", "hora", "inicio"])
+                    ]
 
                     appointments = []
                     for _, row in df.iterrows():
@@ -500,10 +527,10 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                         time = row.get(time_cols[0]) if time_cols else None
 
                         appointments.append({
-                            "name": str(name).strip() if name else None,
-                            "phone": _clean_phone(str(phone)) if phone else None,
-                            "date": str(date).strip() if date else None,
-                            "time": str(time).strip() if time else None,
+                            "name": str(name).strip() if name is not None and str(name).strip() else None,
+                            "phone": _clean_phone(str(phone)) if phone is not None and str(phone).strip() else None,
+                            "date": str(date).strip() if date is not None and str(date).strip() else None,
+                            "time": str(time).strip()[:5] if time is not None and str(time).strip() else None,
                             "timezone": DEFAULT_TZ,
                             "notes": None,
                             "confidence": 1.0,
@@ -788,8 +815,9 @@ def _parse_structured_file(tmp_path: str, filename: str):
         "hora", "time", "inicio cita", "inicio", "hora cita", "comienzo"
     ])
 
+    # OJO: quitamos "inicio cita" de aquí
     datetime_col = _pick_first_matching_column(columns_map, [
-        "fecha hora", "fecha_hora", "datetime", "inicio cita", "start"
+        "fecha hora", "fecha_hora", "datetime", "start"
     ])
 
     print("🧩 columnas detectadas:", {
@@ -812,7 +840,13 @@ def _parse_structured_file(tmp_path: str, filename: str):
         raw_date = None
         raw_time = None
 
-        if datetime_col:
+        # Prioridad: si hay fecha/hora separadas, usar eso
+        if date_col or time_col:
+            raw_date = row.get(date_col) if date_col else None
+            raw_time = row.get(time_col) if time_col else None
+
+        # Solo usar datetime combinado si no existen columnas separadas
+        elif datetime_col:
             dt_value = row.get(datetime_col)
             if dt_value is not None and str(dt_value).strip():
                 if hasattr(dt_value, "strftime"):
@@ -820,11 +854,13 @@ def _parse_structured_file(tmp_path: str, filename: str):
                     raw_time = dt_value.strftime("%H:%M")
                 else:
                     dt_text = str(dt_value).strip()
-                    raw_date = dt_text
-                    raw_time = dt_text
-        else:
-            raw_date = row.get(date_col) if date_col else None
-            raw_time = row.get(time_col) if time_col else None
+                    try:
+                        parsed = pd.to_datetime(dt_text, errors="raise")
+                        raw_date = parsed.strftime("%Y-%m-%d")
+                        raw_time = parsed.strftime("%H:%M")
+                    except Exception:
+                        raw_date = None
+                        raw_time = None
 
         raw_name_str = str(raw_name).strip() if raw_name is not None and str(raw_name).strip() else None
         raw_phone_str = str(raw_phone).strip() if raw_phone is not None and str(raw_phone).strip() else None
