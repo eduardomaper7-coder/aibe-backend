@@ -142,6 +142,8 @@ def import_appointments_payloads(
             summary["rows_extracted"] += len(appointments)
 
             for idx, raw in enumerate(appointments, start=1):
+                if idx % 50 == 0:
+                    print(f"⏳ procesadas {idx}/{len(appointments)} filas")
 
                 raw_name = raw.get("name")
                 raw_phone = raw.get("phone")
@@ -162,7 +164,7 @@ def import_appointments_payloads(
                 patient_state = None
 
                 # -------------------------
-                # Paciente
+                # Paciente en memoria
                 # -------------------------
                 if phone_e164:
                     patient = patients_by_phone.get(phone_e164)
@@ -177,7 +179,6 @@ def import_appointments_payloads(
                         normalized_name=normalized_name,
                         phone_e164=phone_e164,
                     )
-
                     if patient_state == "created":
                         summary["patients_created"] += 1
                     elif patient_state == "updated":
@@ -189,8 +190,52 @@ def import_appointments_payloads(
                         if patient.normalized_name:
                             patients_by_name[patient.normalized_name] = patient
 
+                elif patient:
+                    # actualizar si faltan datos, pero sin buscar otra vez
+                    patient, patient_state = upsert_patient(
+                        db,
+                        job_id=job_id,
+                        display_name=display_name,
+                        normalized_name=normalized_name,
+                        phone_e164=phone_e164,
+                    )
+                    if patient_state == "updated":
+                        summary["patients_updated"] += 1
+
+                    if patient:
+                        if patient.phone_e164:
+                            patients_by_phone[patient.phone_e164] = patient
+                        if patient.normalized_name:
+                            patients_by_name[patient.normalized_name] = patient
+
+                if patient:
+                    add_patient_source(
+                        db,
+                        patient_id=patient.id,
+                        import_file_id=file_row.id,
+                        raw_name=raw_name,
+                        raw_phone=raw_phone,
+                        confidence=confidence,
+                    )
+
+                # -------------------------
+                # Solo paciente
+                # -------------------------
                 if not date_str and not time_str:
                     summary["patient_only_saved"] += 1
+                    items.append({
+                        "kind": "patient",
+                        "patient_id": patient.id if patient else None,
+                        "appointment_id": None,
+                        "review_request_id": None,
+                        "customer_name": patient.display_name if patient else display_name,
+                        "phone_e164": patient.phone_e164 if patient else phone_e164,
+                        "appointment_date": None,
+                        "appointment_time": None,
+                        "status": "patient_saved",
+                        "missing_fields": ["date", "time"],
+                        "issues": raw_issues,
+                    })
                     continue
 
                 final_phone = phone_e164 or (patient.phone_e164 if patient else None)
@@ -198,7 +243,7 @@ def import_appointments_payloads(
                 appointment_date_obj = _to_date_obj(date_str)
 
                 # -------------------------
-                # Buscar cita existente
+                # Cita en memoria
                 # -------------------------
                 appointment = None
 
@@ -217,9 +262,7 @@ def import_appointments_payloads(
                     if len(candidates) == 1:
                         appointment = candidates[0]
 
-                # -------------------------
-                # FIX MERGE POR NOMBRE
-                # -------------------------
+                # Solo fusionar por nombre si NO tenemos fecha/hora
                 if (
                     not appointment
                     and normalized_name
@@ -268,7 +311,6 @@ def import_appointments_payloads(
                         is_too_old=too_old,
                     )
                     summary["appointments_created"] += 1
-
                 else:
                     appointment = update_appointment(
                         db,
@@ -290,14 +332,87 @@ def import_appointments_payloads(
                     )
                     summary["appointments_updated"] += 1
 
-                if appointment.status == "too_old":
-                    summary["too_old"] += 1
-                elif appointment.status == "conflict":
-                    summary["conflicts"] += 1
-                elif appointment.status == "incomplete":
+                # actualizar índices en memoria
+                if appointment.phone_e164 and appointment.appointment_date and appointment.appointment_time:
+                    appointments_by_phone_key[
+                        (appointment.phone_e164, appointment.appointment_date.isoformat(), appointment.appointment_time)
+                    ] = appointment
+
+                if appointment.normalized_name and appointment.appointment_date and appointment.appointment_time:
+                    appointments_by_name_key[
+                        (appointment.normalized_name, appointment.appointment_date.isoformat(), appointment.appointment_time)
+                    ] = appointment
+
+                if appointment.phone_e164 and (appointment.appointment_date is None or appointment.appointment_time is None):
+                    lst = incomplete_appointments_by_phone.setdefault(appointment.phone_e164, [])
+                    if appointment not in lst:
+                        lst.append(appointment)
+
+                if appointment.normalized_name and (appointment.appointment_date is None or appointment.appointment_time is None):
+                    lst = incomplete_appointments_by_name.setdefault(appointment.normalized_name, [])
+                    if appointment not in lst:
+                        lst.append(appointment)
+
+                add_appointment_source(
+                    db,
+                    appointment_id=appointment.id,
+                    import_file_id=file_row.id,
+                    raw_name=raw_name,
+                    raw_phone=raw_phone,
+                    raw_date=str(raw_date) if raw_date is not None else None,
+                    raw_time=str(raw_time) if raw_time is not None else None,
+                    confidence=confidence,
+                )
+
+                if (
+                    appointment.status == "ready"
+                    and appointment.review_request_id is None
+                    and appointment.phone_e164
+                    and appointment.appointment_at
+                ):
+                    rr = review_repo.create_review_request(
+                        db,
+                        job_id=job_id,
+                        customer_name=appointment.display_name or "Paciente",
+                        phone_e164=appointment.phone_e164,
+                        appointment_at=appointment.appointment_at,
+                        send_at=compute_send_at(appointment.appointment_at),
+                    )
+                    attach_review_request_to_appointment(
+                        db,
+                        appointment=appointment,
+                        review_request_id=rr.id,
+                    )
+                    appointment.status = "scheduled"
+                    appointment.review_request_id = rr.id
+                    existing_rr_keys.add((appointment.phone_e164, appointment.appointment_at.isoformat()))
+                    summary["scheduled_now"] += 1
+
+                if appointment.status == "incomplete":
                     summary["incomplete"] += 1
                 elif appointment.status == "duplicate":
                     summary["duplicates"] += 1
+                elif appointment.status == "too_old":
+                    summary["too_old"] += 1
+                elif appointment.status == "conflict":
+                    summary["conflicts"] += 1
+
+                items.append({
+                    "kind": "appointment",
+                    "patient_id": appointment.patient_id,
+                    "appointment_id": appointment.id,
+                    "review_request_id": appointment.review_request_id,
+                    "customer_name": appointment.display_name,
+                    "phone_e164": appointment.phone_e164,
+                    "appointment_date": appointment.appointment_date.isoformat() if appointment.appointment_date else None,
+                    "appointment_time": appointment.appointment_time,
+                    "status": appointment.status,
+                    "missing_fields": list(appointment.missing_fields_json or []),
+                    "issues": list(appointment.issues_json or []),
+                })
+
+                if idx % 200 == 0:
+                    db.flush()
 
         mark_import_batch_completed(db, batch_id=batch.id)
         db.commit()
@@ -309,7 +424,15 @@ def import_appointments_payloads(
         }
 
     except Exception as e:
-        db.rollback()
-        mark_import_batch_failed(db, batch_id=batch.id, error_message=str(e))
-        db.commit()
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+        try:
+            mark_import_batch_failed(db, batch_id=batch.id, error_message=str(e))
+            db.commit()
+        except Exception:
+            pass
+
         raise
