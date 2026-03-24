@@ -1,5 +1,6 @@
 import os
 import json
+
 from twilio.rest import Client
 
 
@@ -25,10 +26,15 @@ def _format_whatsapp_to(to_e164: str) -> str:
 def send_whatsapp_template(*, to_e164: str, template_sid: str, variables: dict) -> str:
     """
     Envía WhatsApp usando Content Template (obligatorio fuera de ventana 24h).
+
     template_sid: ContentSid "HX...."
-    variables: dict con claves "1", "2", ... en string (ej: {"1":"Juan", "2":"https://..."})
-    Devuelve message SID.
+    variables: dict con claves "1", "2", ... en string
+               ejemplo: {"1": "Juan", "2": "https://..."}
+
+    Devuelve el Message SID de Twilio.
     """
+    print("########## SEND_WHATSAPP_TEMPLATE ACTIVO ##########")
+
     from_whatsapp = os.environ.get("TWILIO_WHATSAPP_FROM")
     if not from_whatsapp:
         raise RuntimeError("Falta TWILIO_WHATSAPP_FROM en env vars (ej: whatsapp:+34...)")
@@ -37,28 +43,21 @@ def send_whatsapp_template(*, to_e164: str, template_sid: str, variables: dict) 
         raise RuntimeError("Falta template_sid (ContentSid) para WhatsApp template")
 
     client = get_twilio_client()
-    msg = client.messages.create(
-        from_=from_whatsapp,  # "whatsapp:+34...." o sandbox "whatsapp:+1415..."
-        to=_format_whatsapp_to(to_e164),
-        content_sid=template_sid,
-        content_variables=json.dumps(variables, ensure_ascii=False),
-    )
-    return msg.sid
 
+    formatted_to = _format_whatsapp_to(to_e164)
+    content_variables = json.dumps(variables, ensure_ascii=False)
 
-# (Opcional) Mantengo la función freeform por si algún día la usas dentro de la ventana 24h.
-def send_whatsapp_message(*, to_e164: str, body: str) -> str:
-    """
-    ENVÍO FREEFORM (puede fallar fuera de la ventana 24h con error 63016).
-    """
-    from_whatsapp = os.environ.get("TWILIO_WHATSAPP_FROM")
-    if not from_whatsapp:
-        raise RuntimeError("Falta TWILIO_WHATSAPP_FROM en env vars (ej: whatsapp:+34...)")
+    print(f"[twilio_template] from={from_whatsapp}")
+    print(f"[twilio_template] to={formatted_to}")
+    print(f"[twilio_template] content_sid={template_sid}")
+    print(f"[twilio_template] content_variables={content_variables}")
 
-    client = get_twilio_client()
     msg = client.messages.create(
         from_=from_whatsapp,
-        to=_format_whatsapp_to(to_e164),
-        body=body,
+        to=formatted_to,
+        content_sid=template_sid,
+        content_variables=content_variables,
     )
+
+    print(f"[twilio_template] message sid={msg.sid}")
     return msg.sid

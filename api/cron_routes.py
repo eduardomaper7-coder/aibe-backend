@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from app.db import get_db
 from api.reviews_sync import sync_reviews_all, sync_reviews_for_job
+from app.review_requests.sender import process_pending
 
 router = APIRouter(prefix="/cron", tags=["cron"])
 
@@ -23,3 +24,11 @@ def cron_sync_reviews(
         return sync_reviews_for_job(db, job_id)
 
     return sync_reviews_all(db)
+
+@router.post("/send-review-requests")
+def cron_send_review_requests(
+    secret: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    _check_secret(secret)
+    return process_pending(db)
