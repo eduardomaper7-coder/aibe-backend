@@ -9,13 +9,14 @@ from app.reviews_service import check_and_store_latest_reviews
 
 from .schemas import (
     ReviewRequestCreate,
+    ReviewRequestSendNow,
     ReviewRequestOut,
     ReviewRequestListOut,
     CancelOut,
     BusinessSettingsUpsert,
     BusinessSettingsOut,
 )
-from .utils import compute_send_at
+from .utils import compute_send_at, utcnow
 from . import repo
 
 router = APIRouter(prefix="/api", tags=["review-requests"])
@@ -33,6 +34,25 @@ def create_review_request(payload: ReviewRequestCreate, db: Session = Depends(ge
         appointment_at=payload.appointment_at,
         send_at=send_at,
     )
+    return rr
+
+
+@router.post("/review-requests/send-now", response_model=ReviewRequestOut)
+def send_review_request_now(payload: ReviewRequestSendNow, db: Session = Depends(get_db)):
+    now = utcnow()
+
+    rr = repo.create_review_request(
+        db,
+        job_id=payload.job_id,
+        customer_name=payload.customer_name,
+        phone_e164=payload.phone_e164,
+        appointment_at=now,
+        send_at=now,
+    )
+
+    process_pending(db)
+
+    db.refresh(rr)
     return rr
 
 
@@ -114,6 +134,7 @@ def check_new_reviews(job_id: int = Query(...), db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error comprobando reseñas: {e}")
+
 
 @router.post("/review-requests/send-due")
 def send_due(db: Session = Depends(get_db)):
