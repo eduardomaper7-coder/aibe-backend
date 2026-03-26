@@ -12,6 +12,8 @@ PLAN_CONFIG = {
     "pro": {"credit_eur": 79, "included_reviews": 395},
 }
 
+DEFAULT_BILLING_FLOW = "prepaid"
+
 
 class CheckoutCompletedIn(BaseModel):
     job_id: int
@@ -40,6 +42,14 @@ def checkout_completed(payload: CheckoutCompletedIn, db: Session = Depends(get_d
               included_reviews,
               trial_reviews,
               trial_credit_eur,
+              billing_flow,
+              prepaid_amount_eur,
+              prepaid_at,
+              free_reviews_used,
+              plan_credits_unlocked,
+              refund_requested,
+              refund_requested_amount_eur,
+              manual_paid_override,
               updated_at
             )
             values (
@@ -47,26 +57,37 @@ def checkout_completed(payload: CheckoutCompletedIn, db: Session = Depends(get_d
               :jid,
               :sid,
               :cid,
-              'trialing',
+              'prepaid',
               :plan,
               :credit,
               :included_reviews,
               25,
               5,
+              :billing_flow,
+              :credit,
+              now(),
+              0,
+              false,
+              false,
+              0,
+              false,
               now()
             )
             on conflict (subscription_id)
             do update set
-              user_id=excluded.user_id,
-              job_id=excluded.job_id,
-              stripe_customer_id=excluded.stripe_customer_id,
-              status='trialing',
-              plan=excluded.plan,
-              credit_eur=excluded.credit_eur,
-              included_reviews=excluded.included_reviews,
-              trial_reviews=25,
-              trial_credit_eur=5,
-              updated_at=now()
+              user_id = excluded.user_id,
+              job_id = excluded.job_id,
+              stripe_customer_id = excluded.stripe_customer_id,
+              status = 'prepaid',
+              plan = excluded.plan,
+              credit_eur = excluded.credit_eur,
+              included_reviews = excluded.included_reviews,
+              trial_reviews = 25,
+              trial_credit_eur = 5,
+              billing_flow = excluded.billing_flow,
+              prepaid_amount_eur = excluded.prepaid_amount_eur,
+              prepaid_at = coalesce(subscriptions.prepaid_at, excluded.prepaid_at),
+              updated_at = now()
         """),
         {
             "uid": payload.user_id,
@@ -76,6 +97,7 @@ def checkout_completed(payload: CheckoutCompletedIn, db: Session = Depends(get_d
             "plan": payload.plan,
             "credit": float(plan_data["credit_eur"]),
             "included_reviews": int(plan_data["included_reviews"]),
+            "billing_flow": DEFAULT_BILLING_FLOW,
         },
     )
 
@@ -84,7 +106,7 @@ def checkout_completed(payload: CheckoutCompletedIn, db: Session = Depends(get_d
             update users
             set
               subscription_id = :sid,
-              subscription_status = 'trialing',
+              subscription_status = 'prepaid',
               stripe_customer_id = coalesce(:cid, stripe_customer_id)
             where id = :uid
         """),
@@ -112,8 +134,11 @@ def invoice_paid(payload: InvoicePaidIn, db: Session = Depends(get_db)):
         text("""
             update subscriptions
             set
-              status = 'active',
-              activated_at = now(),
+              status = case
+                when coalesce(plan_credits_unlocked, false) = true then 'active'
+                else 'prepaid'
+              end,
+              prepaid_at = coalesce(prepaid_at, now()),
               updated_at = now()
             where subscription_id = :sid
         """),
@@ -123,7 +148,15 @@ def invoice_paid(payload: InvoicePaidIn, db: Session = Depends(get_db)):
     db.execute(
         text("""
             update users
-            set subscription_status = 'active'
+            set subscription_status = (
+              select case
+                when coalesce(plan_credits_unlocked, false) = true then 'active'
+                else 'prepaid'
+              end
+              from subscriptions
+              where subscription_id = :sid
+              limit 1
+            )
             where subscription_id = :sid
         """),
         {"sid": sid},

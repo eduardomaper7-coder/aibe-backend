@@ -5,16 +5,17 @@ from app.db import get_db
 
 router = APIRouter(prefix="/stripe", tags=["stripe"])
 
+
 @router.post("/sync")
 def stripe_sync(payload: dict, db: Session = Depends(get_db)):
     db.execute(
         text("""
         update users
         set
-          stripe_customer_id=:cid,
-          subscription_id=:sid,
-          subscription_status=:st
-        where id=:uid
+          stripe_customer_id = :cid,
+          subscription_id = :sid,
+          subscription_status = :st
+        where id = :uid
         """),
         {
             "cid": payload["customer_id"],
@@ -37,7 +38,14 @@ def subscription_by_job(job_id: int, db: Session = Depends(get_db)):
               status,
               included_reviews,
               trial_reviews,
-              trial_credit_eur
+              trial_credit_eur,
+              billing_flow,
+              prepaid_amount_eur,
+              prepaid_at,
+              free_reviews_used,
+              plan_credits_unlocked,
+              refund_requested,
+              refund_requested_amount_eur
             from subscriptions
             where job_id = :job_id
             order by updated_at desc
@@ -54,6 +62,13 @@ def subscription_by_job(job_id: int, db: Session = Depends(get_db)):
             "included_reviews": None,
             "trial_reviews": 25,
             "trial_credit_eur": 5,
+            "billing_flow": "prepaid",
+            "prepaid_amount_eur": 0,
+            "prepaid_at": None,
+            "free_reviews_used": 0,
+            "plan_credits_unlocked": False,
+            "refund_requested": False,
+            "refund_requested_amount_eur": 0,
         }
 
     return {
@@ -63,4 +78,11 @@ def subscription_by_job(job_id: int, db: Session = Depends(get_db)):
         "included_reviews": int(row[3]) if row[3] is not None else None,
         "trial_reviews": int(row[4]) if row[4] is not None else 25,
         "trial_credit_eur": float(row[5]) if row[5] is not None else 5,
+        "billing_flow": row[6] or "prepaid",
+        "prepaid_amount_eur": float(row[7]) if row[7] is not None else 0,
+        "prepaid_at": row[8].isoformat() if row[8] is not None else None,
+        "free_reviews_used": int(row[9]) if row[9] is not None else 0,
+        "plan_credits_unlocked": bool(row[10]) if row[10] is not None else False,
+        "refund_requested": bool(row[11]) if row[11] is not None else False,
+        "refund_requested_amount_eur": float(row[12]) if row[12] is not None else 0,
     }
