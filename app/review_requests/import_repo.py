@@ -28,11 +28,19 @@ def create_import_batch(db: Session, *, job_id: int, files_count: int) -> Review
     return row
 
 
-def mark_import_batch_completed(db: Session, *, batch_id: int) -> None:
+def mark_import_batch_completed(
+    db: Session,
+    *,
+    batch_id: int,
+    manual_review_required: bool = False,
+    manual_review_reason: Optional[str] = None,
+) -> None:
     row = db.get(ReviewImportBatch, batch_id)
     if not row:
         return
     row.status = "completed"
+    row.manual_review_required = manual_review_required
+    row.manual_review_reason = manual_review_reason[:4000] if manual_review_reason else None
     row.updated_at = utcnow()
     db.flush()
 
@@ -54,17 +62,26 @@ def create_import_file(
     original_filename: str,
     mime_type: Optional[str],
     file_hash: str,
+    storage_provider: Optional[str] = None,
+    storage_bucket: Optional[str] = None,
+    storage_key: Optional[str] = None,
+    storage_url: Optional[str] = None,
+    size_bytes: Optional[int] = None,
 ) -> ReviewImportFile:
     row = ReviewImportFile(
         batch_id=batch_id,
         original_filename=original_filename,
         mime_type=mime_type,
         file_hash=file_hash,
+        storage_provider=storage_provider,
+        storage_bucket=storage_bucket,
+        storage_key=storage_key,
+        storage_url=storage_url,
+        size_bytes=size_bytes,
     )
     db.add(row)
     db.flush()
     return row
-
 
 def find_patient_by_phone(db: Session, *, job_id: int, phone_e164: str) -> Optional[ReviewPatient]:
     stmt = (

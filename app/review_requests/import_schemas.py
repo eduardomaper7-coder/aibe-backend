@@ -51,3 +51,7 @@ class ImportBatchOut(BaseModel):
     batch_id: int
     summary: ImportSummaryOut
     items: list[ImportItemOut]
+
+    manual_review_required: bool = False
+    manual_review_reason: Optional[str] = None
+    user_message: Optional[str] = None

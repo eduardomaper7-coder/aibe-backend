@@ -31,7 +31,10 @@ from .import_normalizers import (
     is_older_than_24h,
 )
 from .utils import compute_send_at
-
+MANUAL_REVIEW_USER_MESSAGE = (
+    "Tu archivo se ha recibido correctamente. En menos de 24 horas, "
+    "uno de nuestros especialistas configurará el flujo adecuado para tu negocio."
+)
 
 def _to_date_obj(date_str: str | None):
     if not date_str:
@@ -82,6 +85,9 @@ def import_appointments_payloads(
 
     items: list[dict[str, Any]] = []
 
+    ready_appointment_ids: list[int] = []
+    item_index_by_appointment_id: dict[int, int] = {}
+
     try:
         # -------------------------
         # Precarga en memoria
@@ -126,6 +132,8 @@ def import_appointments_payloads(
             if rr.phone_e164 and rr.appointment_at:
                 existing_rr_keys.add((rr.phone_e164, rr.appointment_at.isoformat()))
 
+        pending_rr_keys = set(existing_rr_keys)
+
         # -------------------------
         # Procesamiento
         # -------------------------
@@ -136,6 +144,11 @@ def import_appointments_payloads(
                 original_filename=file_payload["original_filename"],
                 mime_type=file_payload.get("mime_type"),
                 file_hash=file_payload["file_hash"],
+                storage_provider=file_payload.get("storage_provider"),
+                storage_bucket=file_payload.get("storage_bucket"),
+                storage_key=file_payload.get("storage_key"),
+                storage_url=file_payload.get("storage_url"),
+                size_bytes=file_payload.get("size_bytes"),
             )
 
             appointments = file_payload.get("appointments") or []
@@ -191,7 +204,6 @@ def import_appointments_payloads(
                             patients_by_name[patient.normalized_name] = patient
 
                 elif patient:
-                    # actualizar si faltan datos, pero sin buscar otra vez
                     patient, patient_state = upsert_patient(
                         db,
                         job_id=job_id,
@@ -262,7 +274,6 @@ def import_appointments_payloads(
                     if len(candidates) == 1:
                         appointment = candidates[0]
 
-                # Solo fusionar por nombre si NO tenemos fecha/hora
                 if (
                     not appointment
                     and normalized_name
@@ -282,7 +293,8 @@ def import_appointments_payloads(
 
                 duplicate_exists = False
                 if not final_missing and final_phone and appointment_at:
-                    duplicate_exists = (final_phone, appointment_at.isoformat()) in existing_rr_keys
+                    rr_key = (final_phone, appointment_at.isoformat())
+                    duplicate_exists = rr_key in pending_rr_keys
 
                 status = _decide_status(
                     missing_fields=final_missing,
@@ -332,7 +344,6 @@ def import_appointments_payloads(
                     )
                     summary["appointments_updated"] += 1
 
-                # actualizar índices en memoria
                 if appointment.phone_e164 and appointment.appointment_date and appointment.appointment_time:
                     appointments_by_phone_key[
                         (appointment.phone_e164, appointment.appointment_date.isoformat(), appointment.appointment_time)
@@ -370,23 +381,10 @@ def import_appointments_payloads(
                     and appointment.phone_e164
                     and appointment.appointment_at
                 ):
-                    rr = review_repo.create_review_request(
-                        db,
-                        job_id=job_id,
-                        customer_name=appointment.display_name or "Paciente",
-                        phone_e164=appointment.phone_e164,
-                        appointment_at=appointment.appointment_at,
-                        send_at=compute_send_at(appointment.appointment_at),
-                    )
-                    attach_review_request_to_appointment(
-                        db,
-                        appointment=appointment,
-                        review_request_id=rr.id,
-                    )
-                    appointment.status = "scheduled"
-                    appointment.review_request_id = rr.id
-                    existing_rr_keys.add((appointment.phone_e164, appointment.appointment_at.isoformat()))
-                    summary["scheduled_now"] += 1
+                    key = (appointment.phone_e164, appointment.appointment_at.isoformat())
+                    if key not in pending_rr_keys:
+                        ready_appointment_ids.append(appointment.id)
+                        pending_rr_keys.add(key)
 
                 if appointment.status == "incomplete":
                     summary["incomplete"] += 1
@@ -410,17 +408,73 @@ def import_appointments_payloads(
                     "missing_fields": list(appointment.missing_fields_json or []),
                     "issues": list(appointment.issues_json or []),
                 })
+                item_index_by_appointment_id[appointment.id] = len(items) - 1
 
                 if idx % 200 == 0:
                     db.flush()
 
-        mark_import_batch_completed(db, batch_id=batch.id)
+        manual_review_required = False
+        manual_review_reason = None
+
+        ready_candidates = len(ready_appointment_ids)
+
+        if summary["rows_extracted"] == 0:
+            manual_review_required = True
+            manual_review_reason = "No se detectaron registros utilizables"
+        elif ready_candidates == 0 and summary["rows_extracted"] > 0:
+            manual_review_required = True
+            manual_review_reason = "No se obtuvo ninguna cita programable"
+        elif summary["rows_extracted"] > 0 and (summary["incomplete"] / summary["rows_extracted"]) >= 0.5:
+            manual_review_required = True
+            manual_review_reason = "Más del 50% de los registros están incompletos"
+
+        if not manual_review_required:
+            for appointment_id in ready_appointment_ids:
+                appointment = db.get(ReviewAppointment, appointment_id)
+                if not appointment:
+                    continue
+
+                if (
+                    appointment.status == "ready"
+                    and appointment.review_request_id is None
+                    and appointment.phone_e164
+                    and appointment.appointment_at
+                ):
+                    rr = review_repo.create_review_request(
+                        db,
+                        job_id=job_id,
+                        customer_name=appointment.display_name or "Paciente",
+                        phone_e164=appointment.phone_e164,
+                        appointment_at=appointment.appointment_at,
+                        send_at=compute_send_at(appointment.appointment_at),
+                    )
+                    attach_review_request_to_appointment(
+                        db,
+                        appointment=appointment,
+                        review_request_id=rr.id,
+                    )
+                    summary["scheduled_now"] += 1
+
+                    idx = item_index_by_appointment_id.get(appointment.id)
+                    if idx is not None:
+                        items[idx]["status"] = "scheduled"
+                        items[idx]["review_request_id"] = rr.id
+
+        mark_import_batch_completed(
+            db,
+            batch_id=batch.id,
+            manual_review_required=manual_review_required,
+            manual_review_reason=manual_review_reason,
+        )
         db.commit()
 
         return {
             "batch_id": batch.id,
             "summary": summary,
             "items": items,
+            "manual_review_required": manual_review_required,
+            "manual_review_reason": manual_review_reason,
+            "user_message": MANUAL_REVIEW_USER_MESSAGE if manual_review_required else None,
         }
 
     except Exception as e:

@@ -6,7 +6,12 @@ import re
 import shutil
 import tempfile
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from pathlib import Path
+import mimetypes
 
+import boto3
+from botocore.client import Config
 
 import pandas as pd
 from openai import OpenAI
@@ -33,7 +38,70 @@ DEFAULT_COUNTRY = os.getenv("DEFAULT_COUNTRY", "ES")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
+STORAGE_BUCKET = os.getenv("REVIEW_IMPORTS_BUCKET")
+STORAGE_REGION = os.getenv("AWS_REGION", "us-east-1")
+STORAGE_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL")
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+print("BUCKET:", os.getenv("REVIEW_IMPORTS_BUCKET"))
+print("KEY:", os.getenv("AWS_ACCESS_KEY_ID"))
+print("ENDPOINT:", os.getenv("S3_ENDPOINT_URL"))
 
+def _get_s3_client():
+    if not STORAGE_BUCKET or not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY or not STORAGE_ENDPOINT_URL:
+        raise RuntimeError(
+            "Storage no configurado: faltan REVIEW_IMPORTS_BUCKET / AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / S3_ENDPOINT_URL"
+        )
+
+    return boto3.client(
+        "s3",
+        endpoint_url=STORAGE_ENDPOINT_URL,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        region_name=STORAGE_REGION,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def _safe_filename(filename: str) -> str:
+    name = os.path.basename(filename or "upload")
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return name[:180] or "upload"
+
+
+def _store_original_upload(
+    *,
+    job_id: int,
+    filename: str,
+    content: bytes,
+    content_type: Optional[str],
+    file_hash: str,
+) -> dict[str, Any]:
+    s3 = _get_s3_client()
+
+    safe_name = _safe_filename(filename)
+    now = datetime.now(timezone.utc)
+    guessed_type = content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
+
+    key = (
+        f"review-imports/job_{job_id}/"
+        f"{now.strftime('%Y/%m/%d/%H%M%S')}_{file_hash[:12]}_{safe_name}"
+    )
+
+    s3.put_object(
+        Bucket=STORAGE_BUCKET,
+        Key=key,
+        Body=content,
+        ContentType=guessed_type,
+    )
+
+    return {
+        "storage_provider": "supabase_s3",
+        "storage_bucket": STORAGE_BUCKET,
+        "storage_key": key,
+        "storage_url": None,
+        "size_bytes": len(content),
+    }
 
 def _clean_phone(raw: str) -> Optional[str]:
     if not raw:
@@ -568,6 +636,7 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
     return _normalize_extracted_appointments(
         _openai_extract(tmp_path, filename)
     )
+
 @router.post("/import-appointments", response_model=ImportBatchOut)
 async def import_appointments(
     job_id: int = Form(...),
@@ -580,42 +649,40 @@ async def import_appointments(
     print("🔥 file singular:", getattr(file, "filename", None))
     print("🔥 files plural:", [getattr(f, "filename", None) for f in (files or [])])
 
-
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada en backend")
 
-
     incoming_files: List[UploadFile] = []
-
 
     if file is not None:
         incoming_files.append(file)
 
-
     if files:
         incoming_files.extend(files)
-
 
     if not incoming_files:
         raise HTTPException(status_code=400, detail="Debes subir al menos un archivo")
 
-
     files_payload: list[dict[str, Any]] = []
-
 
     for current_file in incoming_files:
         filename = current_file.filename or "upload"
         suffix = os.path.splitext(filename)[1].lower()
 
-
         content = await current_file.read()
         file_hash = hashlib.sha256(content).hexdigest()
 
+        stored = _store_original_upload(
+            job_id=job_id,
+            filename=filename,
+            content=content,
+            content_type=current_file.content_type,
+            file_hash=file_hash,
+        )
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
             tmp.write(content)
-
 
         try:
             data = _extract_with_openai(tmp_path, filename)
@@ -624,13 +691,17 @@ async def import_appointments(
                 "mime_type": current_file.content_type,
                 "file_hash": file_hash,
                 "appointments": data.get("appointments", []),
+                "storage_provider": stored["storage_provider"],
+                "storage_bucket": stored["storage_bucket"],
+                "storage_key": stored["storage_key"],
+                "storage_url": stored.get("storage_url"),
+                "size_bytes": stored["size_bytes"],
             })
         finally:
             try:
                 os.unlink(tmp_path)
             except Exception:
                 pass
-
 
     try:
         result = import_appointments_payloads(

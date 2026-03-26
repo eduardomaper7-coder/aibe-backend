@@ -27,9 +27,16 @@ class ReviewImportBatch(Base):
     files_count = Column(Integer, nullable=False, default=0)
     error_message = Column(Text, nullable=True)
 
+    manual_review_required = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    manual_review_reason = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
-
 
 class ReviewImportFile(Base):
     __tablename__ = "review_import_files"
@@ -41,8 +48,13 @@ class ReviewImportFile(Base):
     mime_type = Column(String(120), nullable=True)
     file_hash = Column(String(128), nullable=False, index=True)
 
-    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    storage_provider = Column(String(32), nullable=True)
+    storage_bucket = Column(String(255), nullable=True)
+    storage_key = Column(Text, nullable=True)
+    storage_url = Column(Text, nullable=True)
+    size_bytes = Column(Integer, nullable=True)
 
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 class ReviewPatient(Base):
     __tablename__ = "review_patients"
