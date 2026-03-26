@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
-
+from .import_models import ReviewAppointment
 from . import repo as review_repo
 from .import_repo import (
     create_import_batch,
@@ -467,6 +467,10 @@ def import_appointments_payloads(
             manual_review_reason=manual_review_reason,
         )
         db.commit()
+        
+        print("SUMMARY:", summary)
+        print("MANUAL REVIEW:", manual_review_required, manual_review_reason)
+        print("ITEMS SAMPLE:", items[:5])
 
         return {
             "batch_id": batch.id,

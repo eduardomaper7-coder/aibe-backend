@@ -192,7 +192,170 @@ def _try_read_text_file(tmp_path: str) -> Optional[str]:
 
 
     return None
+def _extract_pdf_text(file_path: str) -> Optional[str]:
+    """
+    Extrae texto plano de un PDF usando pypdf.
+    Devuelve None si no puede extraer nada útil.
+    """
+    try:
+        reader = PdfReader(file_path)
+        pages_text = []
 
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+
+            if text and text.strip():
+                pages_text.append(text)
+
+        full_text = "\n".join(pages_text).strip()
+        return full_text or None
+    except Exception:
+        return None
+
+
+def _normalize_detected_date(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+
+    raw = raw.strip()
+
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+
+    try:
+        dt = pd.to_datetime(raw, dayfirst=True, errors="coerce")
+        if pd.isna(dt):
+            return None
+        return dt.strftime("%Y-%m-%d")
+    except Exception:
+        return None
+
+
+def _normalize_detected_time(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+
+    raw = raw.strip().replace(".", ":")
+
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%H:%M")
+        except Exception:
+            pass
+
+    m = re.match(r"^(\d{1,2}):(\d{2})$", raw)
+    if not m:
+        return None
+
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+        return f"{hh:02d}:{mm:02d}"
+
+    return None
+
+
+def _extract_appointments_from_text_locally(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Heurística local para texto extraído de PDFs.
+    Intenta detectar bloques con nombre, teléfono, fecha y hora.
+    """
+    if not text or not text.strip():
+        return None
+
+    blocks = re.split(r"\n\s*\n+", text)
+    appointments = []
+
+    phone_re = re.compile(r"(\+?\d[\d\s().-]{7,}\d)")
+    time_re = re.compile(r"\b(\d{1,2}:\d{2})\b")
+
+    date_patterns = [
+        re.compile(r"\b(\d{4}-\d{2}-\d{2})\b"),
+        re.compile(r"\b(\d{2}/\d{2}/\d{4})\b"),
+        re.compile(r"\b(\d{2}-\d{2}-\d{4})\b"),
+        re.compile(r"\b(\d{2}/\d{2}/\d{2})\b"),
+        re.compile(r"\b(\d{2}-\d{2}-\d{2})\b"),
+    ]
+
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+
+        joined = " | ".join(lines)
+
+        phone_match = phone_re.search(joined)
+        raw_phone = phone_match.group(1) if phone_match else None
+        phone = _clean_phone(raw_phone or "")
+
+        raw_date = None
+        for date_re in date_patterns:
+            m = date_re.search(joined)
+            if m:
+                raw_date = m.group(1)
+                break
+        date = _normalize_detected_date(raw_date or "")
+
+        time_match = time_re.search(joined)
+        raw_time = time_match.group(1) if time_match else None
+        time = _normalize_detected_time(raw_time or "")
+
+        # Nombre: primera línea "útil" que no sea claramente fecha/hora/teléfono
+        name = None
+        for line in lines:
+            normalized = line.lower()
+
+            if phone_re.search(line):
+                continue
+            if time_re.search(line):
+                continue
+            if any(dp.search(line) for dp in date_patterns):
+                continue
+            if normalized in {"calendar", "google calendar", "viernes", "sábado", "domingo"}:
+                continue
+
+            if len(line) >= 2:
+                name = line.strip()
+                break
+
+        # Si no detectamos nada relevante, ignoramos el bloque
+        if not any([name, phone, date, time]):
+            continue
+
+        issues = []
+        if not name:
+            issues.append("missing_name")
+        if not phone:
+            issues.append("missing_phone")
+        if not date:
+            issues.append("missing_date")
+        if not time:
+            issues.append("missing_time")
+
+        appointments.append({
+            "name": name,
+            "phone": phone,
+            "date": date,
+            "time": time,
+            "timezone": DEFAULT_TZ,
+            "notes": None,
+            "confidence": 0.7,
+            "issues": issues,
+        })
+
+    if not appointments:
+        return None
+
+    return {
+        "appointments": appointments,
+        "unparsed": [],
+    }
 
 JSON_SCHEMA: Dict[str, Any] = {
     "name": "appointments_extract",
@@ -620,8 +783,9 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                 _openai_extract_from_text(text, filename)
             )
 
-    # 4) PDF -> OpenAI
+    # 4) PDF -> OpenAI directo
     if _is_pdf(filename):
+        print(f"📄 PDF enviado a OpenAI directamente: {filename}")
         return _normalize_extracted_appointments(
             _openai_extract(tmp_path, filename)
         )
