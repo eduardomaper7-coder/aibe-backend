@@ -291,7 +291,7 @@ def scrape_and_store(
         google_maps_url=google_maps_url,
         place_key=place_key,
         place_name=place_name,
-        actor_id=settings.APIFY_ACTOR_ID,
+        actor_id=settings.APIFY_REVIEWS_ACTOR_ID,
         status="running",
     )
 
