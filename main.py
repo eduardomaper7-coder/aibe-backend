@@ -11,12 +11,12 @@ from dotenv import load_dotenv
 
 load_dotenv()  # ✅ Railway friendly
 
-from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Body
 import json
 import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
-
+from api.geogrid import router as geogrid_router
 import requests
 from supabase_client import supabase
 from app.db import Base, engine, get_db
@@ -43,15 +43,16 @@ from app.models import ScrapeJob, Review
 from app.reviews_service import scrape_and_store
 from app.models_analysis_cache import AnalysisCache
 from app.models_ai_reply_cache import ReviewAIReply
-
+from services.serp_provider import find_business_coordinates
 from sqlalchemy import text
 from api.gbp_routes import router as gbp_router
-
+from services.apify_places import find_business_coordinates_apify
+from services.serp_provider import find_business_coordinates
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi import Security, Header
 from urllib.parse import urlparse, parse_qs, unquote
 from api.cron_routes import router as cron_router
-
+from app.apify_client import ApifyWrapper
 from api.auth_routes import router as auth_router
 from api.jobs_routes import router as jobs_router
 from api.stripe_webhook_routes import router as stripe_webhook_router
@@ -139,6 +140,7 @@ app.include_router(auth_router)
 app.include_router(jobs_router)
 app.include_router(stripe_webhook_router)
 app.include_router(stripe_router)
+app.include_router(geogrid_router)
 # =========================
 # Rutas
 # =========================
@@ -1186,6 +1188,7 @@ def normalize_gmaps_url(url: str) -> str:
 def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
     # ✅ DEBUG: qué llega realmente
     print("📥 /scrape payload place_name:", req.place_name)
+    print("📥 /scrape payload city:", getattr(req, "city", None))
     print("📥 /scrape payload google_maps_url:", req.google_maps_url)
 
     def looks_like_place_id_or_url(v: str) -> bool:
@@ -1203,7 +1206,11 @@ def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
     if incoming_name and not looks_like_place_id_or_url(incoming_name):
         safe_name = incoming_name
 
-    # ✅ Normaliza la URL SIEMPRE (evita /maps/search y fuerza hl=es cuando es place_id)
+    # ✅ Normaliza ciudad
+    incoming_city = (getattr(req, "city", None) or "").strip()
+    safe_city: Optional[str] = incoming_city or None
+
+    # ✅ Normaliza la URL SIEMPRE
     raw_url = str(req.google_maps_url)
 
     # ✅ 1) Quitar consentimiento si viene
@@ -1214,28 +1221,40 @@ def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
     normalized_url = normalize_gmaps_url(raw_url)
     print("🔁 normalized_url:", normalized_url)
 
-    # Ejecuta el scraping y guarda en SQLite
+    # Ejecuta el scraping y guarda en DB
     job, saved = scrape_and_store(
         db=db,
         google_maps_url=normalized_url,
         max_reviews=req.max_reviews,
         personal_data=req.personal_data,
-        place_name=safe_name,  # ✅ solo pasa nombre si es válido
+        place_name=safe_name,
     )
 
-    # ✅ Guardar el nombre SOLO si es válido
+    # ✅ Guardar nombre y ciudad si son válidos
+    updated = False
+
     if safe_name:
         job.place_name = safe_name
-        db.add(job)
-        db.commit()
-        db.refresh(job)
+        updated = True
         print("✅ Nombre guardado en job.place_name:", job.place_name)
     else:
         print("⚠️ No guardo place_name porque parece URL/place_id o viene vacío:", incoming_name)
 
+    if safe_city:
+        job.city = safe_city
+        updated = True
+        print("✅ Ciudad guardada en job.city:", job.city)
+    else:
+        print("⚠️ No guardo city porque viene vacía")
+
+    if updated:
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
     print("🧪 SCRAPE terminado. job_id =", job.id)
 
-    # ⬇️ Lógica opcional de Supabase (NO afecta al nombre en el panel)
+    # ⬇️ Lógica opcional de Supabase
     try:
         if supabase is None:
             print("❌ Supabase es None en /scrape")
@@ -1246,7 +1265,7 @@ def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
                 .upsert(
                     {
                         "id": job.id,
-                        "place_name": job.place_name,  # ✅ lo que quedó guardado
+                        "place_name": job.place_name,
                     },
                     on_conflict="id",
                 )
@@ -1257,7 +1276,6 @@ def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
     except Exception as e:
         print("❌ Error guardando en analyses:", repr(e))
 
-    # Respuesta al frontend
     return {
         "job_id": job.id,
         "status": job.status,
@@ -1419,7 +1437,53 @@ def get_job_meta(job_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return {
-        "place_name": job.place_name
+        "place_name": job.place_name,
+        "city": job.city,
+        "latitude": job.latitude,
+        "longitude": job.longitude,
+    }
+
+@app.post("/jobs/{job_id}/resolve-location")
+def resolve_job_location(
+    job_id: int,
+    payload: dict = Body(...),
+    db: Session = Depends(get_db),
+):
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    city = (payload.get("city") or "").strip()
+    if not city:
+        raise HTTPException(status_code=400, detail="City is required")
+
+    job.city = city
+
+    coords = None
+
+    if job.place_name:
+        try:
+            apify = ApifyWrapper()
+            coords = apify.find_place_coordinates(
+                clinic_name=job.place_name,
+                city=city,
+            )
+            print("📍 coords Apify Places:", coords)
+        except Exception as e:
+            print("⚠️ error Apify Places:", e)
+
+    if coords:
+        job.latitude = coords["lat"]
+        job.longitude = coords["lng"]
+
+    db.commit()
+    db.refresh(job)
+
+    return {
+        "place_name": job.place_name,
+        "city": job.city,
+        "latitude": job.latitude,
+        "longitude": job.longitude,
     }
 
 @app.get("/admin/debug/google-oauth")

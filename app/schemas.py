@@ -4,7 +4,8 @@ from typing import Optional
 
 class ScrapeRequest(BaseModel):
     google_maps_url: HttpUrl
-    place_name: str | None = None   # ✅ NUEVO
+    place_name: str | None = None
+    city: str | None = None
     max_reviews: int
     personal_data: bool = True
 

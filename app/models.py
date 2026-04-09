@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import (
     String,
     Integer,
+    Float,
     DateTime,
     Text,
     JSON,
@@ -23,6 +24,9 @@ class ScrapeJob(Base):
 
     place_key: Mapped[str] = mapped_column(String, index=True, nullable=False)
     place_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    city: Mapped[str | None] = mapped_column(String, nullable=True)
+    latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     actor_id: Mapped[str] = mapped_column(String, nullable=False)
     apify_run_id: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -44,7 +48,6 @@ class ScrapeJob(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
-
 
 class Review(Base):
     __tablename__ = "reviews"
