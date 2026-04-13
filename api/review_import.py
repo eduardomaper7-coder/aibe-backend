@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
 from pathlib import Path
 import mimetypes
-
+from datetime import datetime, timezone, date
 import boto3
 from botocore.client import Config
 
@@ -260,6 +260,149 @@ def _normalize_detected_time(raw: str) -> Optional[str]:
 
     return None
 
+SPANISH_MONTHS = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
+SPANISH_WEEKDAYS = {
+    "lunes", "martes", "miercoles", "miércoles", "jueves",
+    "viernes", "sabado", "sábado", "domingo"
+}
+
+
+def _normalize_text_for_date(value: str) -> str:
+    s = (value or "").strip().lower()
+    s = re.sub(r"[,\.;]", " ", s)
+    s = re.sub(r"\bde\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _parse_spanish_text_date(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+
+    s = _normalize_text_for_date(raw)
+    if not s:
+        return None
+
+    tokens = [tok for tok in s.split() if tok not in SPANISH_WEEKDAYS]
+    if not tokens:
+        return None
+
+    s = " ".join(tokens)
+    current_year = datetime.now().year
+
+    # 14 abril 2025 / 14 abril
+    m = re.match(r"^(\d{1,2})\s+([a-záéíóú]+)(?:\s+(\d{4}))?$", s, re.IGNORECASE)
+    if m:
+        day = int(m.group(1))
+        month_name = m.group(2).lower()
+        year = int(m.group(3)) if m.group(3) else current_year
+        month = SPANISH_MONTHS.get(month_name)
+        if month:
+            try:
+                return date(year, month, day).isoformat()
+            except Exception:
+                return None
+
+    # abril 14 2025 / abril 14
+    m = re.match(r"^([a-záéíóú]+)\s+(\d{1,2})(?:\s+(\d{4}))?$", s, re.IGNORECASE)
+    if m:
+        month_name = m.group(1).lower()
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else current_year
+        month = SPANISH_MONTHS.get(month_name)
+        if month:
+            try:
+                return date(year, month, day).isoformat()
+            except Exception:
+                return None
+
+    return None
+
+
+def _repair_extracted_appointments(data: Dict[str, Any]) -> Dict[str, Any]:
+    appointments = data.get("appointments") or []
+    if not appointments:
+        return data
+
+    # Normalizar horas y fechas individuales
+    for it in appointments:
+        raw_time = it.get("time")
+        raw_date = it.get("date")
+
+        norm_time = _normalize_detected_time(raw_time or "")
+        if norm_time:
+            it["time"] = norm_time
+
+        norm_date = _normalize_detected_date(raw_date or "")
+        if not norm_date:
+            norm_date = _parse_spanish_text_date(raw_date or "")
+        if norm_date:
+            it["date"] = norm_date
+
+    # Si hay una fecha dominante/no nula, propagarla a las citas sin fecha
+    unique_dates = []
+    for it in appointments:
+        d = it.get("date")
+        if d and d not in unique_dates:
+            unique_dates.append(d)
+
+    if len(unique_dates) == 1:
+        shared_date = unique_dates[0]
+        for it in appointments:
+            if not it.get("date"):
+                it["date"] = shared_date
+                issues = list(it.get("issues") or [])
+                issues = [x for x in issues if x != "missing_date"]
+                it["issues"] = issues
+
+    # Recalcular issues mínimos
+    for it in appointments:
+        issues = list(it.get("issues") or [])
+
+        if not (it.get("name") or "").strip():
+            if "missing_name" not in issues:
+                issues.append("missing_name")
+        else:
+            issues = [x for x in issues if x != "missing_name"]
+
+        if not (it.get("phone") or "").strip():
+            if "missing_phone" not in issues:
+                issues.append("missing_phone")
+        else:
+            issues = [x for x in issues if x != "missing_phone"]
+
+        if not (it.get("date") or "").strip():
+            if "missing_date" not in issues:
+                issues.append("missing_date")
+        else:
+            issues = [x for x in issues if x != "missing_date"]
+
+        if not (it.get("time") or "").strip():
+            if "missing_time" not in issues:
+                issues.append("missing_time")
+        else:
+            issues = [x for x in issues if x != "missing_time"]
+
+        it["issues"] = issues
+
+    data["appointments"] = appointments
+    return data
+
 
 def _extract_appointments_from_text_locally(text: str) -> Optional[Dict[str, Any]]:
     """
@@ -391,12 +534,36 @@ JSON_SCHEMA: Dict[str, Any] = {
 
 
 def _normalize_extracted_appointments(data: Dict[str, Any]) -> Dict[str, Any]:
+    data = _repair_extracted_appointments(data)
+
     for it in data.get("appointments", []):
-        it["phone"] = _clean_phone(it.get("phone") or "")
+        raw_phone = it.get("phone") or ""
+        raw_date = it.get("date") or ""
+        raw_time = it.get("time") or ""
+
+        it["phone"] = _clean_phone(raw_phone)
+        it["date"] = (
+            _normalize_detected_date(raw_date)
+            or _parse_spanish_text_date(raw_date)
+            or (raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None)
+        )
+        it["time"] = _normalize_detected_time(raw_time) or (
+            raw_time.strip() if isinstance(raw_time, str) and raw_time.strip() else None
+        )
         it["timezone"] = it.get("timezone") or DEFAULT_TZ
         it["issues"] = list(it.get("issues") or [])
         it["confidence"] = float(it.get("confidence") or 0.0)
-    return data
+
+        if not it.get("name") and "missing_name" not in it["issues"]:
+            it["issues"].append("missing_name")
+        if not it.get("phone") and "missing_phone" not in it["issues"]:
+            it["issues"].append("missing_phone")
+        if not it.get("date") and "missing_date" not in it["issues"]:
+            it["issues"].append("missing_date")
+        if not it.get("time") and "missing_time" not in it["issues"]:
+            it["issues"].append("missing_time")
+
+    return _repair_extracted_appointments(data)
 
 
 
@@ -585,7 +752,7 @@ def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
     import base64
     import json
     import re
-
+    from datetime import datetime
 
     ext = (filename or "").lower().split(".")[-1]
     mime = {
@@ -596,24 +763,61 @@ def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
         "heic": "image/heic",
     }.get(ext, "image/png")
 
-
     with open(file_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode("utf-8")
 
-
     data_url = f"data:{mime};base64,{b64}"
-
+    current_year = datetime.now().year
 
     prompt = f"""
-Eres un extractor de citas de clínica.
-Devuelve SOLO JSON válido con este formato:
-{{"appointments":[{{"name":null,"phone":null,"date":null,"time":null,"timezone":null,"notes":null,"confidence":0.0,"issues":[]}}],"unparsed":[]}}
+Eres un extractor experto de citas médicas a partir de imágenes.
+La imagen puede ser una agenda manuscrita, una hoja impresa, una captura, una foto con texto a mano o una mezcla de ambas.
+
+Devuelve SOLO JSON válido con este formato exacto:
+{{
+  "appointments": [
+    {{
+      "name": null,
+      "phone": null,
+      "date": null,
+      "time": null,
+      "timezone": null,
+      "notes": null,
+      "confidence": 0.0,
+      "issues": []
+    }}
+  ],
+  "unparsed": []
+}}
+
+Objetivo:
+- Detectar todas las citas visibles.
+- Cada cita debe tener name, phone, date, time.
+- Si falta un dato, usa null y añade: missing_name / missing_phone / missing_date / missing_time.
+- timezone por defecto: {DEFAULT_TZ}.
+- Normaliza teléfonos españoles de 9 dígitos a E.164 (+34...).
+- Las horas pueden venir como 9.40, 9:40, 930, 13.15. Devuélvelas como HH:MM.
+- Si la fecha está una sola vez en el encabezado de la agenda, aplícala a todas las citas de esa página.
+- La fecha puede venir como:
+  - 14/04/2025
+  - 14-04-2025
+  - 2025-04-14
+  - 14 abril 2025
+  - abril 14 2025
+  - lunes 14 abril
+  - abril 14 lunes
+- Si aparece día y mes pero no año, usa {current_year}, salvo que el documento muestre claramente otro año.
+- No inventes nombres ni teléfonos.
+- Ignora líneas vacías, adornos, separadores, horas sin paciente y marcas visuales.
+- Si una línea tiene estructura tipo: hora + nombre + teléfono, interprétala como cita.
+- Si una misma fecha general aplica a toda la hoja, no marques missing_date por cada fila si la fecha puede inferirse claramente del encabezado.
+- Si hay texto dudoso, ponlo en notes o en unparsed, pero no inventes.
+
 Archivo: {filename}
 """.strip()
 
-
-    resp = client.responses.create(
-        model="gpt-4.1-mini",
+    base_payload = dict(
+        model="gpt-4.1",
         input=[{
             "role": "user",
             "content": [
@@ -623,15 +827,36 @@ Archivo: {filename}
         }],
     )
 
+    try:
+        resp = client.responses.create(
+            **base_payload,
+            response_format={
+                "type": "json_schema",
+                "json_schema": JSON_SCHEMA,
+            },
+        )
+        return json.loads(resp.output_text)
+    except TypeError:
+        pass
 
+    try:
+        resp = client.responses.create(
+            **base_payload,
+            format={
+                "type": "json_schema",
+                "json_schema": JSON_SCHEMA,
+            },
+        )
+        return json.loads(resp.output_text)
+    except TypeError:
+        pass
+
+    resp = client.responses.create(**base_payload)
     out = resp.output_text or ""
     m = re.search(r"\{[\s\S]*\}", out)
     if not m:
         raise ValueError(f"No se encontró JSON en la respuesta: {out[:300]}")
     return json.loads(m.group(0))
-
-
-
 
 def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
 

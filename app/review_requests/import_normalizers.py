@@ -6,6 +6,26 @@ from datetime import date, datetime, time, timezone, timedelta
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
+SPANISH_MONTHS = {
+    "enero": 1,
+    "febrero": 2,
+    "marzo": 3,
+    "abril": 4,
+    "mayo": 5,
+    "junio": 6,
+    "julio": 7,
+    "agosto": 8,
+    "septiembre": 9,
+    "setiembre": 9,
+    "octubre": 10,
+    "noviembre": 11,
+    "diciembre": 12,
+}
+
+SPANISH_WEEKDAYS = {
+    "lunes", "martes", "miercoles", "miércoles", "jueves",
+    "viernes", "sabado", "sábado", "domingo"
+}
 
 def normalize_name(value: Optional[str]) -> Optional[str]:
     if not value:
@@ -61,6 +81,51 @@ def normalize_phone(value: Optional[str], default_country: str = "ES") -> Option
 
     return None
 
+def _parse_spanish_text_date(value: Any) -> Optional[date]:
+    if value is None or value == "":
+        return None
+
+    s = str(value).strip().lower()
+    if not s:
+        return None
+
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = re.sub(r"[,.;]", " ", s)
+    s = re.sub(r"\bde\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+
+    tokens = [tok for tok in s.split() if tok not in SPANISH_WEEKDAYS]
+    if not tokens:
+        return None
+
+    s = " ".join(tokens)
+    current_year = datetime.now().year
+
+    m = re.match(r"^(\d{1,2})\s+([a-z]+)(?:\s+(\d{4}))?$", s)
+    if m:
+        day = int(m.group(1))
+        month = SPANISH_MONTHS.get(m.group(2))
+        year = int(m.group(3)) if m.group(3) else current_year
+        if month:
+            try:
+                return date(year, month, day)
+            except Exception:
+                return None
+
+    m = re.match(r"^([a-z]+)\s+(\d{1,2})(?:\s+(\d{4}))?$", s)
+    if m:
+        month = SPANISH_MONTHS.get(m.group(1))
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else current_year
+        if month:
+            try:
+                return date(year, month, day)
+            except Exception:
+                return None
+
+    return None
+
 
 def _parse_date(value: Any) -> Optional[date]:
     if value is None or value == "":
@@ -89,6 +154,10 @@ def _parse_date(value: Any) -> Optional[date]:
         except Exception:
             continue
 
+    parsed_es = _parse_spanish_text_date(s)
+    if parsed_es:
+        return parsed_es
+
     try:
         return datetime.fromisoformat(s.replace("Z", "")).date()
     except Exception:
@@ -110,6 +179,8 @@ def _parse_time(value: Any) -> Optional[time]:
         return None
 
     s = s.replace(".", ":")
+    s = re.sub(r"\s+", "", s)
+
     for fmt in ("%H:%M", "%H:%M:%S", "%H%M"):
         try:
             return datetime.strptime(s, fmt).time().replace(second=0, microsecond=0)
@@ -124,7 +195,6 @@ def _parse_time(value: Any) -> Optional[time]:
             return time(hour=hh, minute=mm)
 
     return None
-
 
 def normalize_date_str(value: Any) -> Optional[str]:
     d = _parse_date(value)

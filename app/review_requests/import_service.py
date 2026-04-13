@@ -158,6 +158,9 @@ def import_appointments_payloads(
                 if idx % 50 == 0:
                     print(f"⏳ procesadas {idx}/{len(appointments)} filas")
 
+                if idx <= 20:
+                    print("RAW IMPORT ROW:", raw)
+
                 raw_name = raw.get("name")
                 raw_phone = raw.get("phone")
                 raw_date = raw.get("date")
@@ -172,6 +175,21 @@ def import_appointments_payloads(
                 date_str = normalize_date_str(raw_date)
                 time_str = normalize_time_str(raw_time)
                 appointment_at = build_appointment_at(date_str, time_str, timezone_str)
+
+                if idx <= 20:
+                    print("NORMALIZED IMPORT ROW:", {
+                        "display_name": display_name,
+                        "normalized_name": normalized_name,
+                        "raw_phone": raw_phone,
+                        "phone_e164": phone_e164,
+                        "raw_date": raw_date,
+                        "date_str": date_str,
+                        "raw_time": raw_time,
+                        "time_str": time_str,
+                        "timezone": timezone_str,
+                        "appointment_at": appointment_at.isoformat() if appointment_at else None,
+                        "issues": raw_issues,
+                    })
 
                 patient = None
                 patient_state = None
@@ -424,9 +442,13 @@ def import_appointments_payloads(
         elif ready_candidates == 0 and summary["rows_extracted"] > 0:
             manual_review_required = True
             manual_review_reason = "No se obtuvo ninguna cita programable"
-        elif summary["rows_extracted"] > 0 and (summary["incomplete"] / summary["rows_extracted"]) >= 0.5:
+        elif (
+            summary["rows_extracted"] > 0
+            and ready_candidates == 0
+            and (summary["incomplete"] / summary["rows_extracted"]) >= 0.5
+        ):
             manual_review_required = True
-            manual_review_reason = "Más del 50% de los registros están incompletos"
+            manual_review_reason = "Más del 50% de los registros están incompletos y no hay ninguna cita programable"
 
         if not manual_review_required:
             for appointment_id in ready_appointment_ids:
