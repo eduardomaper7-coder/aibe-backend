@@ -90,6 +90,27 @@ class BusinessSettings(Base):
         server_default="false",
     )
 
+    # 👇 NUEVO
+    whatsapp_provider = Column(
+        String(50),
+        nullable=False,
+        default="twilio",
+        server_default="twilio",
+    )
+
+    whatsapp_personal_number = Column(String(32), nullable=True)
+
+    whatsapp_personal_enabled = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+
+    whatsapp_session_status = Column(String(50), nullable=True)
+
+    whatsapp_last_error = Column(Text, nullable=True)
+
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),

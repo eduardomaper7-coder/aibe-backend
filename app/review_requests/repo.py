@@ -260,6 +260,11 @@ def upsert_business_settings(
     google_review_url: Optional[str] = None,
     business_name: Optional[str] = None,
     prevent_duplicate_whatsapp: Optional[bool] = None,
+    whatsapp_provider: Optional[str] = None,
+    whatsapp_personal_number: Optional[str] = None,
+    whatsapp_personal_enabled: Optional[bool] = None,
+    whatsapp_session_status: Optional[str] = None,
+    whatsapp_last_error: Optional[str] = None,
 ) -> BusinessSettings:
     bs = db.get(BusinessSettings, job_id)
     if not bs:
@@ -278,10 +283,28 @@ def upsert_business_settings(
     if prevent_duplicate_whatsapp is not None:
         bs.prevent_duplicate_whatsapp = bool(prevent_duplicate_whatsapp)
 
+    if whatsapp_provider is not None:
+        bs.whatsapp_provider = whatsapp_provider.strip() if whatsapp_provider else "twilio"
+
+    if whatsapp_personal_number is not None:
+        bs.whatsapp_personal_number = (
+            whatsapp_personal_number.strip() if whatsapp_personal_number else None
+        )
+
+    if whatsapp_personal_enabled is not None:
+        bs.whatsapp_personal_enabled = bool(whatsapp_personal_enabled)
+
+    if whatsapp_session_status is not None:
+        bs.whatsapp_session_status = (
+            whatsapp_session_status.strip() if whatsapp_session_status else None
+        )
+
+    if whatsapp_last_error is not None:
+        bs.whatsapp_last_error = whatsapp_last_error.strip() if whatsapp_last_error else None
+
     db.commit()
     db.refresh(bs)
     return bs
-
 
 def build_review_url_from_place_id(place_id: str) -> str:
     place_id = (place_id or "").strip()

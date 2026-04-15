@@ -20,7 +20,6 @@ from api.geogrid import router as geogrid_router
 import requests
 from supabase_client import supabase
 from app.db import Base, engine, get_db
-
 from urllib.parse import urlparse, parse_qs
 from fastapi.middleware.cors import CORSMiddleware
 from openai import OpenAI
@@ -134,6 +133,8 @@ app.include_router(google_oauth_router)
 app.include_router(nextauth_link_router)
 app.include_router(review_import_router)
 from app.review_requests.router import router as review_requests_router
+from app.review_requests.business_settings_router import router as business_settings_router
+app.include_router(business_settings_router)
 app.include_router(review_requests_router)
 app.include_router(cron_router)
 app.include_router(auth_router)
