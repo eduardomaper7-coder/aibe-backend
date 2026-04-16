@@ -12,7 +12,7 @@ import mimetypes
 from datetime import datetime, timezone, date
 import boto3
 from botocore.client import Config
-
+from app.review_requests.import_normalizers import normalize_name, normalize_phone
 import pandas as pd
 from openai import OpenAI
 from pypdf import PdfReader
@@ -859,7 +859,6 @@ Archivo: {filename}
     return json.loads(m.group(0))
 
 def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
-
     # 1) .gz -> descomprimir y volver a procesar
     if _is_gz(filename):
         extracted_path = None
@@ -874,88 +873,104 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # 2) Intentar parser estructurado primero (CSV / Excel / JSON)
+    # 2) Intentar parser estructurado primero (CSV / Excel / JSON con extensión)
     parsed = _parse_structured_file(tmp_path, filename)
     if parsed and parsed.get("appointments"):
         print(f"⚡ archivo estructurado detectado → sin OpenAI: {filename}")
         return _normalize_extracted_appointments(parsed)
 
-    # 3) Si no tiene extensión, intenta detectar formato estructurado por contenido
+    # 3) Si no tiene extensión, detectar formato por cabecera
     ext = os.path.splitext(filename)[1].lower()
     if not ext:
-        # 3A) Intentar como CSV sin extensión
+        head = b""
         try:
-            df = pd.read_csv(tmp_path)
-            if df is not None and not df.empty:
-                print(f"📊 archivo sin extensión tratado como CSV: {filename}")
-
-                columns_map = {str(c).strip().lower(): c for c in df.columns}
-                phone_cols = [
-                    orig for low, orig in columns_map.items()
-                    if any(k in low for k in ["phone", "movil", "móvil", "mobile", "tel", "telefono", "teléfono"])
-                ]
-                name_cols = [
-                    orig for low, orig in columns_map.items()
-                    if any(k in low for k in ["name", "patient", "nombre", "paciente", "cliente"])
-                ]
-                date_cols = [
-                    orig for low, orig in columns_map.items()
-                    if any(k in low for k in ["date", "fecha", "dia", "día"])
-                ]
-                time_cols = [
-                    orig for low, orig in columns_map.items()
-                    if any(k in low for k in ["time", "hora", "inicio"])
-                ]
-
-                appointments = []
-                for _, row in df.iterrows():
-                    name = row.get(name_cols[0]) if name_cols else None
-                    phone = row.get(phone_cols[0]) if phone_cols else None
-                    date = row.get(date_cols[0]) if date_cols else None
-                    time = row.get(time_cols[0]) if time_cols else None
-
-                    appointments.append({
-                        "name": str(name).strip() if name is not None and str(name).strip() else None,
-                        "phone": _clean_phone(str(phone)) if phone is not None and str(phone).strip() else None,
-                        "date": str(date).strip() if date is not None and str(date).strip() else None,
-                        "time": str(time).strip()[:5] if time is not None and str(time).strip() else None,
-                        "timezone": DEFAULT_TZ,
-                        "notes": None,
-                        "confidence": 1.0,
-                        "issues": [],
-                    })
-
-                return _normalize_extracted_appointments({
-                    "appointments": appointments,
-                    "unparsed": []
-                })
+            with open(tmp_path, "rb") as f:
+                head = f.read(4096).lstrip()
         except Exception:
-            pass
+            head = b""
 
-        # 3B) Intentar como JSON sin extensión
-        try:
-            with open(tmp_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
+        looks_like_json = head.startswith(b"{") or head.startswith(b"[")
+        looks_like_csv = (
+            b"," in head[:1024]
+            or b";" in head[:1024]
+            or b"\t" in head[:1024]
+        )
 
-            nested = _parse_nested_patients_json(raw) if isinstance(raw, dict) else None
-            if nested:
-                print(f"🧾 archivo sin extensión tratado como JSON anidado: {filename}")
-                return _normalize_extracted_appointments(nested)
+        # 3A) JSON primero si parece JSON
+        if looks_like_json:
+            try:
+                with open(tmp_path, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
 
-            if isinstance(raw, dict):
-                if "pacientes" in raw and isinstance(raw["pacientes"], list):
-                    data = raw["pacientes"]
+                nested = _parse_nested_patients_json(raw) if isinstance(raw, dict) else None
+                if nested:
+                    print(f"🧾 archivo sin extensión tratado como JSON anidado: {filename}")
+                    return _normalize_extracted_appointments(nested)
+
+                if isinstance(raw, dict):
+                    if "pacientes" in raw and isinstance(raw["pacientes"], list):
+                        data = raw["pacientes"]
+                    else:
+                        data = list(raw.values())
+                elif isinstance(raw, list):
+                    data = raw
                 else:
-                    data = list(raw.values())
-            elif isinstance(raw, list):
-                data = raw
-            else:
-                data = []
+                    data = []
 
-            if data:
-                df = pd.DataFrame(data)
-                if not df.empty:
-                    print(f"🧾 archivo sin extensión tratado como JSON: {filename}")
+                if data:
+                    df = pd.DataFrame(data)
+                    if not df.empty:
+                        print(f"🧾 archivo sin extensión tratado como JSON: {filename}")
+
+                        columns_map = {str(c).strip().lower(): c for c in df.columns}
+                        phone_cols = [
+                            orig for low, orig in columns_map.items()
+                            if any(k in low for k in ["phone", "movil", "móvil", "mobile", "tel", "telefono", "teléfono"])
+                        ]
+                        name_cols = [
+                            orig for low, orig in columns_map.items()
+                            if any(k in low for k in ["name", "patient", "nombre", "paciente", "cliente"])
+                        ]
+                        date_cols = [
+                            orig for low, orig in columns_map.items()
+                            if any(k in low for k in ["date", "fecha", "dia", "día"])
+                        ]
+                        time_cols = [
+                            orig for low, orig in columns_map.items()
+                            if any(k in low for k in ["time", "hora", "inicio"])
+                        ]
+
+                        appointments = []
+                        for _, row in df.iterrows():
+                            name = row.get(name_cols[0]) if name_cols else None
+                            phone = row.get(phone_cols[0]) if phone_cols else None
+                            date = row.get(date_cols[0]) if date_cols else None
+                            time = row.get(time_cols[0]) if time_cols else None
+
+                            appointments.append({
+                                "name": str(name).strip() if name is not None and str(name).strip() else None,
+                                "phone": _clean_phone(str(phone)) if phone is not None and str(phone).strip() else None,
+                                "date": str(date).strip() if date is not None and str(date).strip() else None,
+                                "time": str(time).strip()[:5] if time is not None and str(time).strip() else None,
+                                "timezone": DEFAULT_TZ,
+                                "notes": None,
+                                "confidence": 1.0,
+                                "issues": [],
+                            })
+
+                        return _normalize_extracted_appointments({
+                            "appointments": appointments,
+                            "unparsed": []
+                        })
+            except Exception:
+                pass
+
+        # 3B) CSV solo si parece CSV o si JSON no funcionó
+        if looks_like_csv or not looks_like_json:
+            try:
+                df = pd.read_csv(tmp_path)
+                if df is not None and not df.empty:
+                    print(f"📊 archivo sin extensión tratado como CSV: {filename}")
 
                     columns_map = {str(c).strip().lower(): c for c in df.columns}
                     phone_cols = [
@@ -997,8 +1012,8 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                         "appointments": appointments,
                         "unparsed": []
                     })
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # 3C) Si no era estructurado, leer como texto y mandar a OpenAI
         text = _try_read_text_file(tmp_path)
@@ -1025,6 +1040,23 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
     return _normalize_extracted_appointments(
         _openai_extract(tmp_path, filename)
     )
+
+def _collect_import_keys(files_payload: list[dict[str, Any]]) -> tuple[set[str], set[str]]:
+    phones: set[str] = set()
+    names: set[str] = set()
+
+    for file_payload in files_payload:
+        for raw in file_payload.get("appointments") or []:
+            phone = normalize_phone(raw.get("phone"))
+            name = normalize_name(raw.get("name"))
+
+            if phone:
+                phones.add(phone)
+            if name:
+                names.add(name)
+
+    return phones, names
+
 
 @router.post("/import-appointments", response_model=ImportBatchOut)
 async def import_appointments(

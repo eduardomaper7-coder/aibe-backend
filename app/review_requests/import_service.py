@@ -171,6 +171,7 @@ def import_appointments_payloads(
                     db.flush()
                     db.commit()
 
+
                 raw_name = raw.get("name")
                 raw_phone = raw.get("phone")
                 raw_date = raw.get("date")
