@@ -42,7 +42,7 @@ def mark_import_batch_completed(
     row.manual_review_required = manual_review_required
     row.manual_review_reason = manual_review_reason[:4000] if manual_review_reason else None
     row.updated_at = utcnow()
-    db.flush()
+    
 
 
 def mark_import_batch_failed(db: Session, *, batch_id: int, error_message: str) -> None:
@@ -52,7 +52,7 @@ def mark_import_batch_failed(db: Session, *, batch_id: int, error_message: str) 
     row.status = "failed"
     row.error_message = error_message[:4000]
     row.updated_at = utcnow()
-    db.flush()
+    
 
 
 def create_import_file(
@@ -157,11 +157,9 @@ def upsert_patient(
     changed = True
 
     if changed:
-        db.flush()
         return patient, "updated"
 
     return patient, "unchanged"
-
 
 def add_patient_source(
     db: Session,
@@ -380,7 +378,7 @@ def update_appointment(
     appointment.is_too_old = is_too_old
     appointment.updated_at = utcnow()
 
-    db.flush()
+    
     return appointment
 
 
@@ -416,7 +414,6 @@ def attach_review_request_to_appointment(
     appointment.review_request_id = review_request_id
     appointment.status = "scheduled"
     appointment.updated_at = utcnow()
-    db.flush()
 
 def load_patients_for_job(db: Session, *, job_id: int) -> list[ReviewPatient]:
     stmt = select(ReviewPatient).where(ReviewPatient.job_id == job_id)
@@ -425,4 +422,61 @@ def load_patients_for_job(db: Session, *, job_id: int) -> list[ReviewPatient]:
 
 def load_appointments_for_job(db: Session, *, job_id: int) -> list[ReviewAppointment]:
     stmt = select(ReviewAppointment).where(ReviewAppointment.job_id == job_id)
+    return list(db.execute(stmt).scalars().all())
+
+def load_patients_for_job_matching(
+    db: Session,
+    *,
+    job_id: int,
+    phones: set[str],
+    names: set[str],
+) -> list[ReviewPatient]:
+    clauses = []
+
+    if phones:
+        clauses.append(ReviewPatient.phone_e164.in_(phones))
+    if names:
+        clauses.append(ReviewPatient.normalized_name.in_(names))
+
+    if not clauses:
+        return []
+
+    stmt = (
+        select(ReviewPatient)
+        .where(
+            and_(
+                ReviewPatient.job_id == job_id,
+                or_(*clauses),
+            )
+        )
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def load_appointments_for_job_matching(
+    db: Session,
+    *,
+    job_id: int,
+    phones: set[str],
+    names: set[str],
+) -> list[ReviewAppointment]:
+    clauses = []
+
+    if phones:
+        clauses.append(ReviewAppointment.phone_e164.in_(phones))
+    if names:
+        clauses.append(ReviewAppointment.normalized_name.in_(names))
+
+    if not clauses:
+        return []
+
+    stmt = (
+        select(ReviewAppointment)
+        .where(
+            and_(
+                ReviewAppointment.job_id == job_id,
+                or_(*clauses),
+            )
+        )
+    )
     return list(db.execute(stmt).scalars().all())

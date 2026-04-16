@@ -1033,10 +1033,7 @@ async def import_appointments(
     files: Optional[List[UploadFile]] = File(None),
     db: Session = Depends(get_db),
 ):
-    print("🔥 import_appointments hit")
-    print("🔥 job_id:", job_id)
-    print("🔥 file singular:", getattr(file, "filename", None))
-    print("🔥 files plural:", [getattr(f, "filename", None) for f in (files or [])])
+    print("🔥 import_appointments hit", job_id)
 
     if not os.getenv("OPENAI_API_KEY"):
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada en backend")
@@ -1093,15 +1090,20 @@ async def import_appointments(
                 pass
 
     try:
+        # 🔥 NUEVO: extraer claves para precarga eficiente
+        preload_phones, preload_names = _collect_import_keys(files_payload)
+
         result = import_appointments_payloads(
             db,
             job_id=job_id,
             files_payload=files_payload,
+            preload_phones=preload_phones,
+            preload_names=preload_names,
         )
         return JSONResponse(result)
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"No se pudo importar: {e}")
-
 
 def _chunk_text(text: str, size: int = 25000):
     chunks = []

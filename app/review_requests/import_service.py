@@ -17,8 +17,8 @@ from .import_repo import (
     update_appointment,
     add_appointment_source,
     attach_review_request_to_appointment,
-    load_patients_for_job,
-    load_appointments_for_job,
+    load_patients_for_job_matching,
+    load_appointments_for_job_matching,
 )
 from .import_normalizers import (
     normalize_name,
@@ -60,12 +60,18 @@ def _decide_status(
     return "ready"
 
 
+
 def import_appointments_payloads(
     db: Session,
     *,
     job_id: int,
     files_payload: list[dict[str, Any]],
+    preload_phones: set[str] | None = None,
+    preload_names: set[str] | None = None,
 ) -> dict[str, Any]:
+    CHUNK_FLUSH_EVERY = 1000
+    MAX_RESPONSE_ITEMS = 200
+
     batch = create_import_batch(db, job_id=job_id, files_count=len(files_payload))
 
     summary = {
@@ -84,16 +90,24 @@ def import_appointments_payloads(
     }
 
     items: list[dict[str, Any]] = []
+    items_truncated = False
 
     ready_appointment_ids: list[int] = []
     item_index_by_appointment_id: dict[int, int] = {}
 
     try:
-        # -------------------------
-        # Precarga en memoria
-        # -------------------------
-        existing_patients = load_patients_for_job(db, job_id=job_id)
-        existing_appointments = load_appointments_for_job(db, job_id=job_id)
+        existing_patients = load_patients_for_job_matching(
+            db,
+            job_id=job_id,
+            phones=preload_phones or set(),
+            names=preload_names or set(),
+        )
+        existing_appointments = load_appointments_for_job_matching(
+            db,
+            job_id=job_id,
+            phones=preload_phones or set(),
+            names=preload_names or set(),
+        )
         existing_rrs = review_repo.load_existing_review_requests_for_job(db, job_id=job_id)
 
         patients_by_phone: dict[str, Any] = {}
@@ -134,9 +148,6 @@ def import_appointments_payloads(
 
         pending_rr_keys = set(existing_rr_keys)
 
-        # -------------------------
-        # Procesamiento
-        # -------------------------
         for file_payload in files_payload:
             file_row = create_import_file(
                 db,
@@ -155,11 +166,10 @@ def import_appointments_payloads(
             summary["rows_extracted"] += len(appointments)
 
             for idx, raw in enumerate(appointments, start=1):
-                if idx % 50 == 0:
+                if idx % CHUNK_FLUSH_EVERY == 0:
                     print(f"⏳ procesadas {idx}/{len(appointments)} filas")
-
-                if idx <= 20:
-                    print("RAW IMPORT ROW:", raw)
+                    db.flush()
+                    db.commit()
 
                 raw_name = raw.get("name")
                 raw_phone = raw.get("phone")
@@ -176,27 +186,9 @@ def import_appointments_payloads(
                 time_str = normalize_time_str(raw_time)
                 appointment_at = build_appointment_at(date_str, time_str, timezone_str)
 
-                if idx <= 20:
-                    print("NORMALIZED IMPORT ROW:", {
-                        "display_name": display_name,
-                        "normalized_name": normalized_name,
-                        "raw_phone": raw_phone,
-                        "phone_e164": phone_e164,
-                        "raw_date": raw_date,
-                        "date_str": date_str,
-                        "raw_time": raw_time,
-                        "time_str": time_str,
-                        "timezone": timezone_str,
-                        "appointment_at": appointment_at.isoformat() if appointment_at else None,
-                        "issues": raw_issues,
-                    })
-
                 patient = None
                 patient_state = None
 
-                # -------------------------
-                # Paciente en memoria
-                # -------------------------
                 if phone_e164:
                     patient = patients_by_phone.get(phone_e164)
                 if not patient and normalized_name:
@@ -248,12 +240,9 @@ def import_appointments_payloads(
                         confidence=confidence,
                     )
 
-                # -------------------------
-                # Solo paciente
-                # -------------------------
                 if not date_str and not time_str:
                     summary["patient_only_saved"] += 1
-                    items.append({
+                    patient_item = {
                         "kind": "patient",
                         "patient_id": patient.id if patient else None,
                         "appointment_id": None,
@@ -265,16 +254,17 @@ def import_appointments_payloads(
                         "status": "patient_saved",
                         "missing_fields": ["date", "time"],
                         "issues": raw_issues,
-                    })
+                    }
+                    if len(items) < MAX_RESPONSE_ITEMS:
+                        items.append(patient_item)
+                    else:
+                        items_truncated = True
                     continue
 
                 final_phone = phone_e164 or (patient.phone_e164 if patient else None)
                 final_missing = detect_missing_fields(normalized_name, final_phone, date_str, time_str)
                 appointment_date_obj = _to_date_obj(date_str)
 
-                # -------------------------
-                # Cita en memoria
-                # -------------------------
                 appointment = None
 
                 if final_phone and appointment_date_obj and time_str:
@@ -413,7 +403,7 @@ def import_appointments_payloads(
                 elif appointment.status == "conflict":
                     summary["conflicts"] += 1
 
-                items.append({
+                appointment_item = {
                     "kind": "appointment",
                     "patient_id": appointment.patient_id,
                     "appointment_id": appointment.id,
@@ -425,11 +415,13 @@ def import_appointments_payloads(
                     "status": appointment.status,
                     "missing_fields": list(appointment.missing_fields_json or []),
                     "issues": list(appointment.issues_json or []),
-                })
-                item_index_by_appointment_id[appointment.id] = len(items) - 1
+                }
 
-                if idx % 200 == 0:
-                    db.flush()
+                if len(items) < MAX_RESPONSE_ITEMS:
+                    items.append(appointment_item)
+                    item_index_by_appointment_id[appointment.id] = len(items) - 1
+                else:
+                    items_truncated = True
 
         manual_review_required = False
         manual_review_reason = None
@@ -489,15 +481,21 @@ def import_appointments_payloads(
             manual_review_reason=manual_review_reason,
         )
         db.commit()
-        
-        print("SUMMARY:", summary)
-        print("MANUAL REVIEW:", manual_review_required, manual_review_reason)
-        print("ITEMS SAMPLE:", items[:5])
+
+        print("✅ import completado", {
+            "batch_id": batch.id,
+            "rows_extracted": summary["rows_extracted"],
+            "scheduled_now": summary["scheduled_now"],
+            "manual_review_required": manual_review_required,
+            "items_returned": len(items),
+            "items_truncated": items_truncated,
+        })
 
         return {
             "batch_id": batch.id,
             "summary": summary,
             "items": items,
+            "items_truncated": items_truncated,
             "manual_review_required": manual_review_required,
             "manual_review_reason": manual_review_reason,
             "user_message": MANUAL_REVIEW_USER_MESSAGE if manual_review_required else None,
