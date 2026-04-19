@@ -221,10 +221,12 @@ def check_and_store_latest_reviews(
 
 def scrape_and_store(
     db: Session,
+    job_id: int,
     google_maps_url: str,
     max_reviews: int,
     personal_data: bool,
     place_name: Optional[str] = None,
+    city: Optional[str] = None,
 ) -> tuple[ScrapeJob, int]:
 
     google_maps_url = google_maps_url.strip()
@@ -264,36 +266,21 @@ def scrape_and_store(
         None
     )
 
-    place_name = incoming if (incoming and not looks_like_place_id_or_url(incoming)) else fallback
+    resolved_place_name = incoming if (incoming and not looks_like_place_id_or_url(incoming)) else fallback
 
-    existing_job = (
-        db.query(ScrapeJob)
-        .filter(ScrapeJob.place_key == place_key)
-        .first()
-    )
+    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
+    if not job:
+        raise ValueError(f"No existe ScrapeJob con id={job_id}")
 
-    if existing_job:
-        if place_name and existing_job.place_name != place_name:
-            existing_job.place_name = place_name
-            db.add(existing_job)
-            db.commit()
-            db.refresh(existing_job)
-
-        saved = (
-            db.query(Review)
-            .filter(Review.job_id == existing_job.id)
-            .count()
-        )
-        print("♻️ Local ya scrapeado. Reutilizando reseñas.")
-        return existing_job, saved
-
-    job = ScrapeJob(
-        google_maps_url=google_maps_url,
-        place_key=place_key,
-        place_name=place_name,
-        actor_id=settings.APIFY_REVIEWS_ACTOR_ID,
-        status="running",
-    )
+    job.google_maps_url = google_maps_url
+    job.place_key = place_key
+    if resolved_place_name:
+        job.place_name = resolved_place_name
+    if city:
+        job.city = city
+    job.actor_id = settings.APIFY_REVIEWS_ACTOR_ID
+    job.status = "running"
+    job.error = None
 
     db.add(job)
     db.commit()
@@ -308,8 +295,12 @@ def scrape_and_store(
         )
 
         job.apify_run_id = run.get("id")
-        job.status = "succeeded"
+        job.status = "ready"
         db.add(job)
+
+        # Limpiar reseñas anteriores del mismo job antes de guardar las nuevas
+        db.query(Review).filter(Review.job_id == job.id).delete()
+        db.commit()
 
         saved = 0
         for item in items:

@@ -1187,10 +1187,13 @@ def normalize_gmaps_url(url: str) -> str:
 
 @app.post("/scrape", response_model=ScrapeResponse)
 def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
-    # ✅ DEBUG: qué llega realmente
+    print("📥 /scrape payload job_id:", req.job_id)
     print("📥 /scrape payload place_name:", req.place_name)
     print("📥 /scrape payload city:", getattr(req, "city", None))
     print("📥 /scrape payload google_maps_url:", req.google_maps_url)
+
+    if not req.job_id:
+        raise HTTPException(status_code=400, detail="job_id es obligatorio")
 
     def looks_like_place_id_or_url(v: str) -> bool:
         s = (v or "").strip()
@@ -1201,61 +1204,33 @@ def scrape(req: ScrapeRequest, db: Session = Depends(get_db)):
             or ("google.com/maps" in s)
         )
 
-    # ✅ Normaliza y filtra nombre
     incoming_name = (req.place_name or "").strip()
     safe_name: Optional[str] = None
     if incoming_name and not looks_like_place_id_or_url(incoming_name):
         safe_name = incoming_name
 
-    # ✅ Normaliza ciudad
     incoming_city = (getattr(req, "city", None) or "").strip()
     safe_city: Optional[str] = incoming_city or None
 
-    # ✅ Normaliza la URL SIEMPRE
     raw_url = str(req.google_maps_url)
-
-    # ✅ 1) Quitar consentimiento si viene
     raw_url = unwrap_google_consent_url(raw_url)
     print("🧼 unwrapped_url:", raw_url)
 
-    # ✅ 2) Normalizar
     normalized_url = normalize_gmaps_url(raw_url)
     print("🔁 normalized_url:", normalized_url)
 
-    # Ejecuta el scraping y guarda en DB
     job, saved = scrape_and_store(
         db=db,
+        job_id=req.job_id,
         google_maps_url=normalized_url,
         max_reviews=req.max_reviews,
         personal_data=req.personal_data,
         place_name=safe_name,
+        city=safe_city,
     )
-
-    # ✅ Guardar nombre y ciudad si son válidos
-    updated = False
-
-    if safe_name:
-        job.place_name = safe_name
-        updated = True
-        print("✅ Nombre guardado en job.place_name:", job.place_name)
-    else:
-        print("⚠️ No guardo place_name porque parece URL/place_id o viene vacío:", incoming_name)
-
-    if safe_city:
-        job.city = safe_city
-        updated = True
-        print("✅ Ciudad guardada en job.city:", job.city)
-    else:
-        print("⚠️ No guardo city porque viene vacía")
-
-    if updated:
-        db.add(job)
-        db.commit()
-        db.refresh(job)
 
     print("🧪 SCRAPE terminado. job_id =", job.id)
 
-    # ⬇️ Lógica opcional de Supabase
     try:
         if supabase is None:
             print("❌ Supabase es None en /scrape")
@@ -1431,18 +1406,7 @@ async def ai_replies(
 
 
 
-@app.get("/jobs/{job_id}/meta")
-def get_job_meta(job_id: int, db: Session = Depends(get_db)):
-    job = db.query(ScrapeJob).filter(ScrapeJob.id == job_id).first()
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
 
-    return {
-        "place_name": job.place_name,
-        "city": job.city,
-        "latitude": job.latitude,
-        "longitude": job.longitude,
-    }
 
 @app.post("/jobs/{job_id}/resolve-location")
 def resolve_job_location(

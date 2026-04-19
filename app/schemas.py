@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from typing import Optional
 
 class ScrapeRequest(BaseModel):
+    job_id: int | None = None
     google_maps_url: HttpUrl
     place_name: str | None = None
     city: str | None = None
