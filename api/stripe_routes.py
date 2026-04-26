@@ -61,7 +61,6 @@ def subscription_by_job(job_id: int, db: Session = Depends(get_db)):
         {"job_id": job_id},
     ).fetchone()
 
-    # 🔴 Si no hay suscripción
     if not row:
         return {
             "plan": None,
@@ -77,34 +76,68 @@ def subscription_by_job(job_id: int, db: Session = Depends(get_db)):
             "plan_credits_unlocked": False,
             "refund_requested": False,
             "refund_requested_amount_eur": 0,
+            "current_period_start": None,
             "renewal_at": None,
         }
 
     subscription_id = row[0]
+    current_period_start = None
     renewal_at = None
 
-    # 🔵 Obtener fecha real desde Stripe
     if subscription_id:
         try:
             stripe_sub = stripe.Subscription.retrieve(subscription_id)
 
-            current_period_end = getattr(
+            stripe_period_start = getattr(
                 stripe_sub,
-                "current_period_end",
-                None
+                "current_period_start",
+                None,
             )
 
-            if current_period_end:
+            stripe_period_end = getattr(
+                stripe_sub,
+                "current_period_end",
+                None,
+            )
+
+            # Por compatibilidad con algunas versiones de Stripe
+            if not stripe_period_start or not stripe_period_end:
+                items = getattr(stripe_sub, "items", None)
+
+                if items and getattr(items, "data", None):
+                    first_item = items.data[0]
+
+                    if not stripe_period_start:
+                        stripe_period_start = getattr(
+                            first_item,
+                            "current_period_start",
+                            None,
+                        )
+
+                    if not stripe_period_end:
+                        stripe_period_end = getattr(
+                            first_item,
+                            "current_period_end",
+                            None,
+                        )
+
+            if stripe_period_start:
+                current_period_start = datetime.fromtimestamp(
+                    stripe_period_start,
+                    tz=timezone.utc,
+                ).isoformat()
+
+            if stripe_period_end:
                 renewal_at = datetime.fromtimestamp(
-                    current_period_end,
-                    tz=timezone.utc
+                    stripe_period_end,
+                    tz=timezone.utc,
                 ).isoformat()
 
         except Exception as e:
-            print("ERROR STRIPE renewal_at:", repr(e))
+            print("ERROR STRIPE subscription period:", repr(e))
+            current_period_start = None
             renewal_at = None
 
-    # 🔵 Respuesta final
     return {
         "plan": row[1],
         "credit_eur": float(row[2]) if row[2] is not None else None,
@@ -119,5 +152,6 @@ def subscription_by_job(job_id: int, db: Session = Depends(get_db)):
         "plan_credits_unlocked": bool(row[11]) if row[11] is not None else False,
         "refund_requested": bool(row[12]) if row[12] is not None else False,
         "refund_requested_amount_eur": float(row[13]) if row[13] is not None else 0,
+        "current_period_start": current_period_start,
         "renewal_at": renewal_at,
     }

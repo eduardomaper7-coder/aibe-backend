@@ -108,8 +108,12 @@ def upsert_settings(payload: BusinessSettingsUpsert, db: Session = Depends(get_d
 
 
 @router.get("/review-requests/stats")
-def stats(job_id: int = Query(...), db: Session = Depends(get_db)):
-    return repo.get_stats(db, job_id=job_id)
+def stats(
+    job_id: int = Query(...),
+    from_date: str | None = Query(None, alias="from"),
+    db: Session = Depends(get_db),
+):
+    return repo.get_stats(db, job_id=job_id, from_date=from_date)
 
 
 @router.post("/review-requests/check-new-reviews")

@@ -184,27 +184,37 @@ def get_business_settings(db: Session, *, job_id: int) -> Optional[BusinessSetti
     return db.get(BusinessSettings, job_id)
 
 
-def get_stats(db: Session, *, job_id: int):
+def get_stats(db: Session, *, job_id: int, from_date: str | None = None):
     sent_count = db.execute(
         select(func.count(ReviewRequest.id))
         .where(ReviewRequest.job_id == job_id)
         .where(ReviewRequest.status == ReviewRequestStatus.sent)
     ).scalar() or 0
 
-    first_sent_at = db.execute(
-        select(func.min(ReviewRequest.sent_at))
-        .where(ReviewRequest.job_id == job_id)
-        .where(ReviewRequest.status == ReviewRequestStatus.sent)
-    ).scalar()
-
-    reviews_gained = 0
-    if first_sent_at:
-        iso = first_sent_at.isoformat()
+    # 🔵 SI HAY from_date (Stripe), usarlo
+    if from_date:
         reviews_gained = db.execute(
             select(func.count(Review.id))
             .where(Review.job_id == job_id)
-            .where(Review.published_at >= iso)
+            .where(Review.published_at >= from_date)
         ).scalar() or 0
+
+    else:
+        # 🔴 fallback antiguo (no recomendado)
+        first_sent_at = db.execute(
+            select(func.min(ReviewRequest.sent_at))
+            .where(ReviewRequest.job_id == job_id)
+            .where(ReviewRequest.status == ReviewRequestStatus.sent)
+        ).scalar()
+
+        reviews_gained = 0
+        if first_sent_at:
+            iso = first_sent_at.isoformat()
+            reviews_gained = db.execute(
+                select(func.count(Review.id))
+                .where(Review.job_id == job_id)
+                .where(Review.published_at >= iso)
+            ).scalar() or 0
 
     conversion = (reviews_gained / sent_count) if sent_count > 0 else 0.0
 
@@ -213,9 +223,6 @@ def get_stats(db: Session, *, job_id: int):
         "reviews_gained": int(reviews_gained),
         "conversion_rate": float(conversion),
     }
-
-
-PLACE_ID_RE = re.compile(r"place_id:([A-Za-z0-9_-]+)")
 
 
 def ensure_review_url(db: Session, *, job_id: int) -> None:
