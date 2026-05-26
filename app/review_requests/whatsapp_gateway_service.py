@@ -62,10 +62,17 @@ def send_whatsapp_review_message(
     business_name: str | None,
     google_review_url: str | None,
 ) -> dict:
+    name = (customer_name or "").strip() or "😊"
+    review_url = (google_review_url or "").strip()
+    business = f" a {business_name.strip()}" if business_name else ""
+
     message = (
-        f"Hola {customer_name}, gracias por tu visita"
-        f"{' a ' + business_name if business_name else ''}. "
-        f"¿Nos dejas una reseña aquí? {google_review_url}"
+        f"Hola {name} 😊\n\n"
+        f"Gracias por venir hoy{business}.\n"
+        "Para nosotros es muy importante conocer tu opinión.\n\n"
+        "¿Nos ayudas dejando tu reseña aquí?\n"
+        f"{review_url}\n\n"
+        "¡Muchas gracias! 💙"
     )
 
     response = requests.post(
@@ -85,6 +92,8 @@ def send_whatsapp_review_message(
         payload = {"error": response.text}
 
     if response.status_code >= 400:
-        raise WhatsAppGatewayError(payload.get("error") or f"HTTP {response.status_code}")
+        raise WhatsAppGatewayError(
+            payload.get("error") or f"HTTP {response.status_code}"
+        )
 
     return payload
