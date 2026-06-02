@@ -17,7 +17,8 @@ import pandas as pd
 from openai import OpenAI
 from pypdf import PdfReader
 
-
+from google import genai
+from google.genai import types
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -36,7 +37,8 @@ DEFAULT_COUNTRY = os.getenv("DEFAULT_COUNTRY", "ES")
 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 STORAGE_BUCKET = os.getenv("REVIEW_IMPORTS_BUCKET")
 STORAGE_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -788,7 +790,82 @@ Contenido del archivo ({filename}):
     }
 
 
+def _gemini_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
+    import json
+    import re
+    from datetime import datetime
 
+    ext = (filename or "").lower().split(".")[-1]
+    mime = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "webp": "image/webp",
+        "heic": "image/heic",
+    }.get(ext, "image/png")
+
+    with open(file_path, "rb") as f:
+        image_bytes = f.read()
+
+    current_year = datetime.now().year
+
+    prompt = f"""
+Extrae citas médicas desde esta imagen.
+
+Devuelve SOLO JSON válido:
+{{
+  "appointments": [
+    {{
+      "name": null,
+      "phone": null,
+      "date": null,
+      "time": null,
+      "timezone": null,
+      "notes": null,
+      "confidence": 0.0,
+      "phone_confidence": 0.0,
+      "phone_uncertain": true,
+      "issues": []
+    }}
+  ],
+  "unparsed": []
+}}
+
+Reglas:
+- Extrae name, phone, date, time.
+- timezone por defecto: {DEFAULT_TZ}.
+- Si el teléfono español tiene 9 dígitos, normaliza a +34...
+- Lee cada teléfono dos veces.
+- Si algún dígito no está clarísimo, devuelve phone=null.
+- Si hay duda entre 3/8, 6/8, 1/7, 0/9, 5/6, 2/7, 4/9, devuelve phone=null.
+- phone_uncertain=true si hay cualquier duda.
+- phone_confidence >= 0.995 solo si todos los dígitos son perfectamente legibles.
+- No inventes ni completes teléfonos.
+- Si falta dato, añade missing_name / missing_phone / missing_date / missing_time.
+- Si aparece día y mes sin año, usa {current_year}.
+
+Archivo: {filename}
+""".strip()
+
+    resp = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            prompt,
+            types.Part.from_bytes(data=image_bytes, mime_type=mime),
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json"
+        ),
+    )
+
+    out = resp.text or ""
+    try:
+        return json.loads(out)
+    except Exception:
+        m = re.search(r"\{[\s\S]*\}", out)
+        if not m:
+            raise ValueError(f"No se encontró JSON en Gemini: {out[:300]}")
+        return json.loads(m.group(0))
 
 def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
     import base64
@@ -911,6 +988,46 @@ Archivo: {filename}
         raise ValueError(f"No se encontró JSON en la respuesta: {out[:300]}")
     return json.loads(m.group(0))
 
+
+def _merge_verified_image_extractions(openai_data: Dict[str, Any], gemini_data: Dict[str, Any]) -> Dict[str, Any]:
+    openai_items = openai_data.get("appointments") or []
+    gemini_items = gemini_data.get("appointments") or []
+
+    verified = []
+
+    for idx, item in enumerate(openai_items):
+        other = gemini_items[idx] if idx < len(gemini_items) else {}
+
+        phone_1 = _clean_phone(item.get("phone") or "")
+        phone_2 = _clean_phone(other.get("phone") or "")
+
+        issues = list(item.get("issues") or [])
+
+        if not phone_1 or not phone_2 or phone_1 != phone_2:
+            item["phone"] = None
+            item["phone_uncertain"] = True
+            item["phone_confidence"] = 0.0
+
+            if "phone_mismatch_between_ai" not in issues:
+                issues.append("phone_mismatch_between_ai")
+            if "missing_phone" not in issues:
+                issues.append("missing_phone")
+        else:
+            item["phone"] = phone_1
+            item["phone_uncertain"] = False
+            item["phone_confidence"] = min(
+                float(item.get("phone_confidence") or 1.0),
+                float(other.get("phone_confidence") or 1.0),
+            )
+
+        item["issues"] = issues
+        verified.append(item)
+
+    return {
+        "appointments": verified,
+        "unparsed": list(openai_data.get("unparsed") or []) + list(gemini_data.get("unparsed") or []),
+    }
+
 def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
     # 1) .gz -> descomprimir y volver a procesar
     if _is_gz(filename):
@@ -926,7 +1043,7 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-    # 2) Intentar parser estructurado primero (CSV / Excel / JSON con extensión)
+    # 2) Intentar parser estructurado primero
     parsed = _parse_structured_file(tmp_path, filename)
     if parsed and parsed.get("appointments"):
         print(f"⚡ archivo estructurado detectado → sin OpenAI: {filename}")
@@ -949,7 +1066,6 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
             or b"\t" in head[:1024]
         )
 
-        # 3A) JSON primero si parece JSON
         if looks_like_json:
             try:
                 with open(tmp_path, "r", encoding="utf-8") as f:
@@ -957,75 +1073,17 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
 
                 nested = _parse_nested_patients_json(raw) if isinstance(raw, dict) else None
                 if nested:
-                    print(f"🧾 archivo sin extensión tratado como JSON anidado: {filename}")
                     return _normalize_extracted_appointments(nested)
-
-                if isinstance(raw, dict):
-                    if "pacientes" in raw and isinstance(raw["pacientes"], list):
-                        data = raw["pacientes"]
-                    else:
-                        data = list(raw.values())
-                elif isinstance(raw, list):
-                    data = raw
-                else:
-                    data = []
-
-                if data:
-                    df = pd.DataFrame(data)
-                    if not df.empty:
-                        print(f"🧾 archivo sin extensión tratado como JSON: {filename}")
-
-                        columns_map = {str(c).strip().lower(): c for c in df.columns}
-                        phone_cols = [
-                            orig for low, orig in columns_map.items()
-                            if any(k in low for k in ["phone", "movil", "móvil", "mobile", "tel", "telefono", "teléfono"])
-                        ]
-                        name_cols = [
-                            orig for low, orig in columns_map.items()
-                            if any(k in low for k in ["name", "patient", "nombre", "paciente", "cliente"])
-                        ]
-                        date_cols = [
-                            orig for low, orig in columns_map.items()
-                            if any(k in low for k in ["date", "fecha", "dia", "día"])
-                        ]
-                        time_cols = [
-                            orig for low, orig in columns_map.items()
-                            if any(k in low for k in ["time", "hora", "inicio"])
-                        ]
-
-                        appointments = []
-                        for _, row in df.iterrows():
-                            name = row.get(name_cols[0]) if name_cols else None
-                            phone = row.get(phone_cols[0]) if phone_cols else None
-                            date = row.get(date_cols[0]) if date_cols else None
-                            time = row.get(time_cols[0]) if time_cols else None
-
-                            appointments.append({
-                                "name": str(name).strip() if name is not None and str(name).strip() else None,
-                                "phone": _clean_phone(str(phone)) if phone is not None and str(phone).strip() else None,
-                                "date": str(date).strip() if date is not None and str(date).strip() else None,
-                                "time": str(time).strip()[:5] if time is not None and str(time).strip() else None,
-                                "timezone": DEFAULT_TZ,
-                                "notes": None,
-                                "confidence": 1.0,
-                                "issues": [],
-                            })
-
-                        return _normalize_extracted_appointments({
-                            "appointments": appointments,
-                            "unparsed": []
-                        })
             except Exception:
                 pass
 
-        # 3B) CSV solo si parece CSV o si JSON no funcionó
         if looks_like_csv or not looks_like_json:
             try:
                 df = pd.read_csv(tmp_path)
                 if df is not None and not df.empty:
-                    print(f"📊 archivo sin extensión tratado como CSV: {filename}")
-
+                    appointments = []
                     columns_map = {str(c).strip().lower(): c for c in df.columns}
+
                     phone_cols = [
                         orig for low, orig in columns_map.items()
                         if any(k in low for k in ["phone", "movil", "móvil", "mobile", "tel", "telefono", "teléfono"])
@@ -1043,7 +1101,6 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                         if any(k in low for k in ["time", "hora", "inicio"])
                     ]
 
-                    appointments = []
                     for _, row in df.iterrows():
                         name = row.get(name_cols[0]) if name_cols else None
                         phone = row.get(phone_cols[0]) if phone_cols else None
@@ -1058,20 +1115,20 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
                             "timezone": DEFAULT_TZ,
                             "notes": None,
                             "confidence": 1.0,
+                            "phone_confidence": 1.0,
+                            "phone_uncertain": False,
                             "issues": [],
                         })
 
                     return _normalize_extracted_appointments({
                         "appointments": appointments,
-                        "unparsed": []
+                        "unparsed": [],
                     })
             except Exception:
                 pass
 
-        # 3C) Si no era estructurado, leer como texto y mandar a OpenAI
         text = _try_read_text_file(tmp_path)
         if text is not None:
-            print(f"📄 archivo sin extensión tratado como texto: {filename}")
             return _normalize_extracted_appointments(
                 _openai_extract_from_text(text, filename)
             )
@@ -1083,11 +1140,18 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
             _openai_extract(tmp_path, filename)
         )
 
-    # 5) Imagen -> OpenAI
+    # 5) Imagen -> OpenAI + Gemini obligatorio
     if _is_image(filename):
-        return _normalize_extracted_appointments(
-            _openai_extract_image(tmp_path, filename)
-        )
+        openai_data = _openai_extract_image(tmp_path, filename)
+
+        if not gemini_client:
+            raise RuntimeError(
+                "GEMINI_API_KEY no configurada: no se puede verificar imagen con doble IA"
+            )
+
+        gemini_data = _gemini_extract_image(tmp_path, filename)
+        verified_data = _merge_verified_image_extractions(openai_data, gemini_data)
+        return _normalize_extracted_appointments(verified_data)
 
     # 6) Fallback final -> OpenAI
     return _normalize_extracted_appointments(
@@ -1438,6 +1502,8 @@ def _parse_structured_file(tmp_path: str, filename: str):
             "timezone": DEFAULT_TZ,
             "notes": None,
             "confidence": 1.0,
+            "phone_confidence": 1.0,
+            "phone_uncertain": False,
             "issues": issues,
         })
 
