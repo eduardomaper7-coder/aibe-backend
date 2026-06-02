@@ -489,6 +489,8 @@ def _extract_appointments_from_text_locally(text: str) -> Optional[Dict[str, Any
             "timezone": DEFAULT_TZ,
             "notes": None,
             "confidence": 0.7,
+            "phone_confidence": 0.7,
+            "phone_uncertain": True,
             "issues": issues,
         })
 
@@ -519,15 +521,28 @@ JSON_SCHEMA: Dict[str, Any] = {
                         "timezone": {"type": ["string", "null"]},
                         "notes": {"type": ["string", "null"]},
                         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "issues": {"type": "array", "items": {"type": "string"}}
+                        "phone_confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "phone_uncertain": {"type": "boolean"},
+                        "issues": {"type": "array", "items": {"type": "string"}},
                     },
-                    "required": ["name", "phone", "date", "time", "timezone", "notes", "confidence", "issues"]
-                }
+                    "required": [
+                        "name",
+                        "phone",
+                        "date",
+                        "time",
+                        "timezone",
+                        "notes",
+                        "confidence",
+                        "phone_confidence",
+                        "phone_uncertain",
+                        "issues",
+                    ],
+                },
             },
-            "unparsed": {"type": "array", "items": {"type": "string"}}
+            "unparsed": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["appointments", "unparsed"]
-    }
+        "required": ["appointments", "unparsed"],
+    },
 }
 
 
@@ -541,25 +556,52 @@ def _normalize_extracted_appointments(data: Dict[str, Any]) -> Dict[str, Any]:
         raw_date = it.get("date") or ""
         raw_time = it.get("time") or ""
 
-        it["phone"] = _clean_phone(raw_phone)
         it["date"] = (
             _normalize_detected_date(raw_date)
             or _parse_spanish_text_date(raw_date)
             or (raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None)
         )
+
         it["time"] = _normalize_detected_time(raw_time) or (
             raw_time.strip() if isinstance(raw_time, str) and raw_time.strip() else None
         )
+
         it["timezone"] = it.get("timezone") or DEFAULT_TZ
         it["issues"] = list(it.get("issues") or [])
         it["confidence"] = float(it.get("confidence") or 0.0)
 
+        phone_confidence = float(
+            it.get("phone_confidence")
+            if it.get("phone_confidence") is not None
+            else it["confidence"]
+        )
+        phone_uncertain = bool(it.get("phone_uncertain") or False)
+
+        cleaned_phone = _clean_phone(raw_phone)
+
+        if phone_uncertain or phone_confidence < 0.98:
+            it["phone"] = None
+
+            if "phone_uncertain" not in it["issues"]:
+                it["issues"].append("phone_uncertain")
+
+            if "missing_phone" not in it["issues"]:
+                it["issues"].append("missing_phone")
+        else:
+            it["phone"] = cleaned_phone
+
+        it["phone_confidence"] = phone_confidence
+        it["phone_uncertain"] = phone_uncertain
+
         if not it.get("name") and "missing_name" not in it["issues"]:
             it["issues"].append("missing_name")
+
         if not it.get("phone") and "missing_phone" not in it["issues"]:
             it["issues"].append("missing_phone")
+
         if not it.get("date") and "missing_date" not in it["issues"]:
             it["issues"].append("missing_date")
+
         if not it.get("time") and "missing_time" not in it["issues"]:
             it["issues"].append("missing_time")
 
@@ -784,6 +826,8 @@ Devuelve SOLO JSON válido con este formato exacto:
       "timezone": null,
       "notes": null,
       "confidence": 0.0,
+      "phone_confidence": 0.0,
+      "phone_uncertain": true,
       "issues": []
     }}
   ],
@@ -808,6 +852,15 @@ Objetivo:
   - abril 14 lunes
 - Si aparece día y mes pero no año, usa {current_year}, salvo que el documento muestre claramente otro año.
 - No inventes nombres ni teléfonos.
+- Los teléfonos son CRÍTICOS. Lee cada teléfono dos veces de forma independiente antes de devolverlo.
+- Si no estás 100% seguro de TODOS los dígitos del teléfono, devuelve phone=null.
+- Si algún dígito puede confundirse con otro, devuelve phone=null.
+- Confusiones típicas: 3/8, 6/8, 1/7, 0/9, 5/6, 2/7, 4/9.
+- Si el teléfono está cortado, borroso, tapado, parcialmente visible o no se distingue perfectamente, devuelve phone=null.
+- Añade phone_uncertain=true si hay cualquier duda sobre el teléfono.
+- Añade phone_confidence menor que 0.98 si hay cualquier duda sobre el teléfono.
+- Solo usa phone_uncertain=false y phone_confidence >= 0.98 cuando todos los dígitos sean claramente legibles.
+- Nunca corrijas, completes ni reconstruyas teléfonos por intuición.
 - Ignora líneas vacías, adornos, separadores, horas sin paciente y marcas visuales.
 - Si una línea tiene estructura tipo: hora + nombre + teléfono, interprétala como cita.
 - Si una misma fecha general aplica a toda la hoja, no marques missing_date por cada fila si la fecha puede inferirse claramente del encabezado.
@@ -1202,6 +1255,8 @@ def _parse_nested_patients_json(data: dict) -> Optional[Dict[str, Any]]:
                 "timezone": DEFAULT_TZ,
                 "notes": None,
                 "confidence": 1.0,
+                "phone_confidence": 1.0,
+                "phone_uncertain": False,
                 "issues": issues,
             })
             continue
@@ -1225,6 +1280,8 @@ def _parse_nested_patients_json(data: dict) -> Optional[Dict[str, Any]]:
                     "timezone": DEFAULT_TZ,
                     "notes": None,
                     "confidence": 1.0,
+                    "phone_confidence": 1.0,
+                    "phone_uncertain": False,
                     "issues": issues,
                 })
                 continue
@@ -1251,6 +1308,8 @@ def _parse_nested_patients_json(data: dict) -> Optional[Dict[str, Any]]:
                     "timezone": DEFAULT_TZ,
                     "notes": None,
                     "confidence": 1.0,
+                    "phone_confidence": 1.0,
+                    "phone_uncertain": False,
                     "issues": issues,
                 })
 
