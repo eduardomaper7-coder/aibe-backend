@@ -1175,7 +1175,7 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
     if _is_image(filename):
         openai_data = _openai_extract_image(tmp_path, filename)
 
-        if not gemini_client:
+        if not GEMINI_API_KEY:
             raise RuntimeError(
                 "GEMINI_API_KEY no configurada: no se puede verificar imagen con doble IA"
             )
