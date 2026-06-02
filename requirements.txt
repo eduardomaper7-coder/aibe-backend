@@ -20,4 +20,3 @@ email-validator==2.1.1
 stripe==9.8.0
 boto3
 botocore
-google-genai

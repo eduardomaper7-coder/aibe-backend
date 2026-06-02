@@ -17,8 +17,7 @@ import pandas as pd
 from openai import OpenAI
 from pypdf import PdfReader
 
-from google import genai
-from google.genai import types
+
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form, Depends
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -38,7 +37,7 @@ DEFAULT_COUNTRY = os.getenv("DEFAULT_COUNTRY", "ES")
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
 
 STORAGE_BUCKET = os.getenv("REVIEW_IMPORTS_BUCKET")
 STORAGE_REGION = os.getenv("AWS_REGION", "us-east-1")
@@ -791,9 +790,14 @@ Contenido del archivo ({filename}):
 
 
 def _gemini_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
+    import base64
     import json
     import re
+    import requests
     from datetime import datetime
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY no configurada")
 
     ext = (filename or "").lower().split(".")[-1]
     mime = {
@@ -805,7 +809,7 @@ def _gemini_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
     }.get(ext, "image/png")
 
     with open(file_path, "rb") as f:
-        image_bytes = f.read()
+        b64 = base64.b64encode(f.read()).decode("utf-8")
 
     current_year = datetime.now().year
 
@@ -847,18 +851,45 @@ Reglas:
 Archivo: {filename}
 """.strip()
 
-    resp = gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[
-            prompt,
-            types.Part.from_bytes(data=image_bytes, mime_type=mime),
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json"
-        ),
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     )
 
-    out = resp.text or ""
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime,
+                            "data": b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "response_mime_type": "application/json"
+        },
+    }
+
+    response = requests.post(url, json=payload, timeout=120)
+    response.raise_for_status()
+
+    result = response.json()
+
+    out = (
+        result.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "")
+    )
+
+    if not out:
+        raise ValueError(f"Gemini no devolvió texto válido: {str(result)[:500]}")
+
     try:
         return json.loads(out)
     except Exception:
