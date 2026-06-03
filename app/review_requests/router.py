@@ -18,24 +18,44 @@ from .schemas import (
 )
 from .utils import compute_send_at, utcnow
 from . import repo
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+from .models import BusinessSettings
 router = APIRouter(prefix="/api", tags=["review-requests"])
 
 
 @router.post("/review-requests", response_model=ReviewRequestOut)
 def create_review_request(payload: ReviewRequestCreate, db: Session = Depends(get_db)):
-    send_at = compute_send_at(payload.appointment_at)
+
+    bs = db.get(BusinessSettings, payload.job_id)
+
+    timezone_name = (
+        getattr(bs, "timezone", None)
+        or "Europe/Madrid"
+    )
+
+    tz = ZoneInfo(timezone_name)
+
+    local_dt = datetime.combine(
+        payload.appointment_date,
+        payload.appointment_time,
+    ).replace(tzinfo=tz)
+
+    appointment_at = local_dt.astimezone(timezone.utc)
+
+    send_at = compute_send_at(appointment_at)
 
     rr = repo.create_review_request(
         db,
         job_id=payload.job_id,
         customer_name=payload.customer_name,
         phone_e164=payload.phone_e164,
-        appointment_at=payload.appointment_at,
+        appointment_at=appointment_at,
         send_at=send_at,
     )
-    return rr
 
+    return rr
 
 @router.post("/review-requests/send-now", response_model=ReviewRequestOut)
 def send_review_request_now(payload: ReviewRequestSendNow, db: Session = Depends(get_db)):

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, date, time
 from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
@@ -12,7 +12,8 @@ class ReviewRequestCreate(BaseModel):
     job_id: int
     customer_name: str = Field(min_length=1, max_length=200)
     phone_e164: str = Field(min_length=8, max_length=32)
-    appointment_at: datetime
+    appointment_date: date
+    appointment_time: time
 
     @field_validator("phone_e164")
     @classmethod
