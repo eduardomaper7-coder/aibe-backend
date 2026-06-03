@@ -1,0 +1,50 @@
+PROMPT ESPECÍFICO JOB 127 - DENTOPIA / DRA ALICIA MARIN
+
+Esta clínica envía capturas de una agenda diaria tipo Dentopia.
+
+FECHA:
+- La fecha correcta SIEMPRE se obtiene del calendario lateral izquierdo o del encabezado superior.
+- Si el calendario lateral tiene un día resaltado en verde, ese día es la fecha de TODAS las citas visibles.
+- Si arriba aparece un encabezado como "MIÉRCOLES, 03 DE JUNIO DE 2026", esa fecha tiene prioridad.
+- Nunca uses los números grandes de la columna izquierda como día del mes.
+- Los números grandes de la izquierda son HORAS de la agenda: 08, 09, 10, 11, 12, 13, 16, 17, 18, 19.
+- Ejemplo: si está resaltado el día 03 en Junio 2026, todas las citas son 2026-06-03.
+- Ejemplo: si está resaltado el día 01 en Junio 2026, todas las citas son 2026-06-01.
+- Ejemplo: si está resaltado el día 02 en Junio 2026, todas las citas son 2026-06-02.
+- Ejemplo: si está resaltado el día 04 en Junio 2026, todas las citas son 2026-06-04.
+- Nunca conviertas 16:00 en 2026-06-16.
+- Nunca conviertas 17:00 en 2026-06-17.
+- Nunca conviertas 18:00 en 2026-06-18.
+- Nunca conviertas 19:00 en 2026-06-19.
+
+HORA:
+- La hora de cada cita aparece al inicio del bloque: 08:30, 09:15, 16:00, 18:45, etc.
+- Devuelve la hora exacta en formato HH:MM.
+- No restes ni sumes horas.
+- No cambies la hora por zona horaria. La hora visible ya está en Europe/Madrid.
+
+PACIENTE:
+- El nombre del paciente aparece en la segunda línea del bloque, antes del teléfono.
+- Mantén el nombre visible, sin inventar apellidos.
+- No incluyas tratamientos como parte del nombre.
+
+TELÉFONO:
+- El teléfono aparece después del nombre, separado por barras verticales.
+- Los teléfonos españoles suelen tener 9 dígitos y deben normalizarse a +34.
+- Si aparecen dos teléfonos para un paciente, usa el primero solo si está completamente claro.
+- Si cualquier dígito es dudoso, devuelve phone=null.
+- No inventes, completes ni corrijas teléfonos.
+- No uses números de tratamientos, tarifas o códigos internos como teléfono.
+- Ignora textos como TARIFA DENTOPIA 2023, TARIFA DENTOPIA 2026.
+
+TRATAMIENTOS / NOTAS:
+- Textos como "REVISION ORTO BK", "rev invis", "pba", "extraccion simple", "TARIFA DENTOPIA" son tratamiento o notas, no nombre.
+- Puedes poner esos textos en notes si son útiles, pero no son obligatorios.
+- No los uses para construir teléfono ni fecha.
+
+REGLA FINAL DE SEGURIDAD:
+- Antes de devolver cada cita, verifica:
+  1. La fecha es exactamente el día seleccionado en el calendario lateral o encabezado.
+  2. La hora es la hora visible dentro del bloque.
+  3. El teléfono tiene 9 dígitos españoles claros o phone=null.
+  4. Si hay duda entre dos IA o entre lecturas, deja el teléfono como null.

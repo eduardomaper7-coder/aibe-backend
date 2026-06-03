@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from pathlib import Path
 
 from sqlalchemy.orm import Session
 from .import_models import ReviewAppointment
@@ -59,7 +60,23 @@ def _decide_status(
         return "incomplete"
     return "ready"
 
+def _load_clinic_prompt(job_id):
+    if not job_id:
+        return ""
 
+    prompt_path = (
+        Path(__file__).parent
+        / "clinic_prompts"
+        / f"job_{job_id}.txt"
+    )
+
+    if prompt_path.exists():
+        return prompt_path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+    return ""
 
 def import_appointments_payloads(
     db: Session,

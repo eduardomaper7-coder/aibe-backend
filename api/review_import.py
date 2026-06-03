@@ -33,7 +33,23 @@ router = APIRouter(prefix="/api/reviews", tags=["reviews-import"])
 
 DEFAULT_TZ = os.getenv("DEFAULT_TIMEZONE", "Europe/Madrid")
 DEFAULT_COUNTRY = os.getenv("DEFAULT_COUNTRY", "ES")
+def _load_clinic_prompt(job_id):
+    if not job_id:
+        return ""
 
+    prompt_path = (
+        Path(__file__).parent
+        / "clinic_prompts"
+        / f"job_{job_id}.txt"
+    )
+
+    if prompt_path.exists():
+        return prompt_path.read_text(
+            encoding="utf-8",
+            errors="ignore"
+        )
+
+    return ""
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -789,7 +805,11 @@ Contenido del archivo ({filename}):
     }
 
 
-def _gemini_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
+def _gemini_extract_image(
+    file_path: str,
+    filename: str,
+    job_id: int | None = None
+) -> Dict[str, Any]:
     import base64
     import json
     import re
@@ -812,6 +832,7 @@ def _gemini_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
         b64 = base64.b64encode(f.read()).decode("utf-8")
 
     current_year = datetime.now().year
+    clinic_prompt = _load_clinic_prompt(job_id)
 
     prompt = f"""
 Extrae citas médicas desde esta imagen.
@@ -847,6 +868,13 @@ Reglas:
 - No inventes ni completes teléfonos.
 - Si falta dato, añade missing_name / missing_phone / missing_date / missing_time.
 - Si aparece día y mes sin año, usa {current_year}.
+- FECHA CRÍTICA: en capturas de agenda diaria, todas las citas visibles pertenecen al día seleccionado en el calendario lateral o al encabezado principal.
+- No uses los números grandes de la columna izquierda de la agenda como día del mes. Esos números suelen ser HORAS: 08, 09, 10, 11, 12, 13, 16, 17, 18, 19.
+- Si el calendario lateral tiene un día resaltado, usa ese día para todas las citas visibles.
+- Nunca conviertas una hora como 16:00 en fecha 2026-06-16.
+
+Instrucciones específicas de esta clínica:
+{clinic_prompt if clinic_prompt else "No hay instrucciones específicas para esta clínica. Usa las reglas generales anteriores."}
 
 Archivo: {filename}
 """.strip()
@@ -898,7 +926,11 @@ Archivo: {filename}
             raise ValueError(f"No se encontró JSON en Gemini: {out[:300]}")
         return json.loads(m.group(0))
 
-def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
+def _openai_extract_image(
+    file_path: str,
+    filename: str,
+    job_id: int | None = None
+) -> Dict[str, Any]:
     import base64
     import json
     import re
@@ -918,6 +950,7 @@ def _openai_extract_image(file_path: str, filename: str) -> Dict[str, Any]:
 
     data_url = f"data:{mime};base64,{b64}"
     current_year = datetime.now().year
+    clinic_prompt = _load_clinic_prompt(job_id)
 
     prompt = f"""
 Eres un extractor experto de citas médicas a partir de imágenes.
@@ -950,6 +983,10 @@ Objetivo:
 - Normaliza teléfonos españoles de 9 dígitos a E.164 (+34...).
 - Las horas pueden venir como 9.40, 9:40, 930, 13.15. Devuélvelas como HH:MM.
 - Si la fecha está una sola vez en el encabezado de la agenda, aplícala a todas las citas de esa página.
+- FECHA CRÍTICA: en capturas de agenda diaria, todas las citas visibles pertenecen al día seleccionado en el calendario lateral o al encabezado principal.
+- No uses los números grandes de la columna izquierda de la agenda como día del mes. Esos números suelen ser HORAS: 08, 09, 10, 11, 12, 13, 16, 17, 18, 19.
+- Si el calendario lateral tiene un día resaltado, usa ese día para todas las citas visibles.
+- Nunca conviertas una hora como 16:00 en fecha 2026-06-16.
 - La fecha puede venir como:
   - 14/04/2025
   - 14-04-2025
@@ -973,6 +1010,9 @@ Objetivo:
 - Si una línea tiene estructura tipo: hora + nombre + teléfono, interprétala como cita.
 - Si una misma fecha general aplica a toda la hoja, no marques missing_date por cada fila si la fecha puede inferirse claramente del encabezado.
 - Si hay texto dudoso, ponlo en notes o en unparsed, pero no inventes.
+
+Instrucciones específicas de esta clínica:
+{clinic_prompt if clinic_prompt else "No hay instrucciones específicas para esta clínica. Usa las reglas generales anteriores."}
 
 Archivo: {filename}
 """.strip()
@@ -1059,14 +1099,22 @@ def _merge_verified_image_extractions(openai_data: Dict[str, Any], gemini_data: 
         "unparsed": list(openai_data.get("unparsed") or []) + list(gemini_data.get("unparsed") or []),
     }
 
-def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
+def _extract_with_openai(
+    tmp_path: str,
+    filename: str,
+    job_id: int | None = None
+) -> Dict[str, Any]:
     # 1) .gz -> descomprimir y volver a procesar
     if _is_gz(filename):
         extracted_path = None
         try:
             extracted_path, inner_filename = _gunzip_file(tmp_path, filename)
             print(f"📦 .gz detectado: {filename} -> archivo interno: {inner_filename}")
-            return _extract_with_openai(extracted_path, inner_filename)
+            return _extract_with_openai(
+                extracted_path,
+                inner_filename,
+                job_id
+            )
         finally:
             if extracted_path:
                 try:
@@ -1173,15 +1221,28 @@ def _extract_with_openai(tmp_path: str, filename: str) -> Dict[str, Any]:
 
     # 5) Imagen -> OpenAI + Gemini obligatorio
     if _is_image(filename):
-        openai_data = _openai_extract_image(tmp_path, filename)
+        openai_data = _openai_extract_image(
+            tmp_path,
+            filename,
+            job_id
+        )
 
         if not GEMINI_API_KEY:
             raise RuntimeError(
                 "GEMINI_API_KEY no configurada: no se puede verificar imagen con doble IA"
             )
 
-        gemini_data = _gemini_extract_image(tmp_path, filename)
-        verified_data = _merge_verified_image_extractions(openai_data, gemini_data)
+        gemini_data = _gemini_extract_image(
+            tmp_path,
+            filename,
+            job_id
+        )
+
+        verified_data = _merge_verified_image_extractions(
+            openai_data,
+            gemini_data
+        )
+
         return _normalize_extracted_appointments(verified_data)
 
     # 6) Fallback final -> OpenAI
@@ -1251,7 +1312,12 @@ async def import_appointments(
             tmp.write(content)
 
         try:
-            data = _extract_with_openai(tmp_path, filename)
+            data = _extract_with_openai(
+                tmp_path,
+                filename,
+                job_id,
+            )
+
             files_payload.append({
                 "original_filename": filename,
                 "mime_type": current_file.content_type,
@@ -1270,7 +1336,6 @@ async def import_appointments(
                 pass
 
     try:
-        # 🔥 NUEVO: extraer claves para precarga eficiente
         preload_phones, preload_names = _collect_import_keys(files_payload)
 
         result = import_appointments_payloads(
