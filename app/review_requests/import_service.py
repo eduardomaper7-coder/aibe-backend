@@ -32,6 +32,7 @@ from .import_normalizers import (
     is_older_than_24h,
 )
 from .utils import compute_send_at
+from .models import BusinessSettings
 MANUAL_REVIEW_USER_MESSAGE = (
     "Tu archivo se ha recibido correctamente. En menos de 24 horas, "
     "uno de nuestros especialistas configurará el flujo adecuado para tu negocio."
@@ -105,6 +106,9 @@ def import_appointments_payloads(
         "too_old": 0,
         "conflicts": 0,
     }
+
+    bs = db.get(BusinessSettings, job_id)
+    job_timezone = (getattr(bs, "timezone", None) or "Europe/Madrid").strip()
 
     items: list[dict[str, Any]] = []
     items_truncated = False
@@ -193,7 +197,7 @@ def import_appointments_payloads(
                 raw_phone = raw.get("phone")
                 raw_date = raw.get("date")
                 raw_time = raw.get("time")
-                timezone_str = raw.get("timezone") or "Europe/Madrid"
+                timezone_str = job_timezone
                 confidence = raw.get("confidence") or 0.0
                 raw_issues = list(raw.get("issues") or [])
 

@@ -14,12 +14,15 @@ from app.review_requests.whatsapp_gateway_service import (
 
 router = APIRouter(prefix="/api/business-settings", tags=["business-settings"])
 
+ALLOWED_TIMEZONES = {"Europe/Madrid", "Atlantic/Canary"}
+
 
 class BusinessSettingsPatchIn(BaseModel):
     job_id: int
     business_name: Optional[str] = None
     google_review_url: Optional[str] = None
     prevent_duplicate_whatsapp: Optional[bool] = None
+    timezone: Optional[str] = None
 
     whatsapp_provider: Optional[Literal["twilio", "personal_number"]] = None
     whatsapp_personal_number: Optional[str] = None
@@ -49,6 +52,7 @@ def get_business_settings(
         "job_id": row.job_id,
         "google_review_url": row.google_review_url,
         "business_name": row.business_name,
+        "timezone": row.timezone or "Europe/Madrid",
         "prevent_duplicate_whatsapp": row.prevent_duplicate_whatsapp,
         "whatsapp_provider": row.whatsapp_provider,
         "whatsapp_personal_number": row.whatsapp_personal_number,
@@ -79,6 +83,11 @@ def patch_business_settings(
     if payload.prevent_duplicate_whatsapp is not None:
         row.prevent_duplicate_whatsapp = payload.prevent_duplicate_whatsapp
 
+    if payload.timezone is not None:
+        if payload.timezone not in ALLOWED_TIMEZONES:
+            raise HTTPException(status_code=400, detail="Timezone no válido")
+        row.timezone = payload.timezone
+
     if payload.whatsapp_provider is not None:
         row.whatsapp_provider = payload.whatsapp_provider
 
@@ -102,6 +111,7 @@ def patch_business_settings(
         "job_id": row.job_id,
         "google_review_url": row.google_review_url,
         "business_name": row.business_name,
+        "timezone": row.timezone or "Europe/Madrid",
         "prevent_duplicate_whatsapp": row.prevent_duplicate_whatsapp,
         "whatsapp_provider": row.whatsapp_provider,
         "whatsapp_personal_number": row.whatsapp_personal_number,

@@ -83,6 +83,13 @@ class BusinessSettings(Base):
     google_review_url = Column(Text, nullable=True)
     business_name = Column(String(200), nullable=True)
 
+    timezone = Column(
+        String(64),
+        nullable=False,
+        default="Europe/Madrid",
+        server_default="Europe/Madrid",
+    )
+
     prevent_duplicate_whatsapp = Column(
         Boolean,
         nullable=False,
@@ -90,7 +97,6 @@ class BusinessSettings(Base):
         server_default="false",
     )
 
-    # 👇 NUEVO
     whatsapp_provider = Column(
         String(50),
         nullable=False,
